@@ -1,0 +1,147 @@
+-- ============================
+-- Inventory Management Database Schema
+-- ============================
+
+-- ============================
+-- Products Table
+-- ============================
+CREATE TABLE products (
+    product_id      CHAR(36)        NOT NULL PRIMARY KEY,  -- UUID (string form)
+    sku             VARCHAR(20)     NOT NULL UNIQUE,       -- Stock Keeping Unit (unique identifier)
+    name            VARCHAR(200)    NOT NULL,
+    description     TEXT,                                  -- Detailed product description
+    price           DECIMAL(10, 2)  NOT NULL,              -- Price with 2 decimal places
+    category        VARCHAR(100),                          -- Product category (e.g., Electronics)
+    brand           VARCHAR(100),                          -- Brand or manufacturer
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE, -- Product availability status
+    created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    -- Constraints
+    CONSTRAINT chk_price_non_negative CHECK (price >= 0),
+    CONSTRAINT chk_sku_format CHECK (sku REGEXP '^[A-Z0-9\\-]{3,20}$')
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Index for common queries
+CREATE INDEX idx_products_sku ON products(sku);
+CREATE INDEX idx_products_category ON products(category);
+CREATE INDEX idx_products_brand ON products(brand);
+CREATE INDEX idx_products_is_active ON products(is_active);
+
+-- ============================
+-- Inventory Table
+-- ============================
+CREATE TABLE inventory (
+    inventory_id        CHAR(36)        NOT NULL PRIMARY KEY,  -- UUID
+    product_id          CHAR(36)        NOT NULL UNIQUE,       -- FK to products (one-to-one relationship)
+    quantity            INT             NOT NULL DEFAULT 0,    -- Current stock quantity
+    warehouse_location  VARCHAR(100),                          -- Physical location (aisle, bin, shelf)
+    reorder_level       INT,                                   -- Minimum quantity before reorder
+    reorder_quantity    INT,                                   -- Quantity to reorder
+    reserved_quantity   INT             NOT NULL DEFAULT 0,    -- Quantity reserved for pending orders
+    last_restocked_at   DATETIME,                              -- Last time inventory was restocked
+    created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    -- Foreign Key Constraint with CASCADE DELETE
+    CONSTRAINT fk_inventory_product
+        FOREIGN KEY (product_id) REFERENCES products(product_id)
+        ON DELETE CASCADE,
+
+    -- Check Constraints
+    CONSTRAINT chk_quantity_non_negative CHECK (quantity >= 0),
+    CONSTRAINT chk_reserved_quantity_non_negative CHECK (reserved_quantity >= 0),
+    CONSTRAINT chk_reorder_level_non_negative CHECK (reorder_level IS NULL OR reorder_level >= 0),
+    CONSTRAINT chk_reorder_quantity_non_negative CHECK (reorder_quantity IS NULL OR reorder_quantity >= 0),
+    CONSTRAINT chk_reserved_not_exceed_quantity CHECK (reserved_quantity <= quantity)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Indexes for common queries
+CREATE INDEX idx_inventory_product_id ON inventory(product_id);
+CREATE INDEX idx_inventory_warehouse_location ON inventory(warehouse_location);
+CREATE INDEX idx_inventory_quantity ON inventory(quantity);
+
+-- ============================
+-- Inventory Adjustments History Table (Optional - for audit trail)
+-- ============================
+CREATE TABLE inventory_adjustments (
+    adjustment_id   CHAR(36)        NOT NULL PRIMARY KEY,  -- UUID
+    inventory_id    CHAR(36)        NOT NULL,              -- FK to inventory
+    adjustment      INT             NOT NULL,              -- Quantity added (positive) or removed (negative)
+    reason          VARCHAR(200),                          -- Reason for adjustment (restock, sale, damage, etc.)
+    adjusted_by     VARCHAR(100),                          -- User or system that made the adjustment
+    adjusted_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    -- Foreign Key Constraint
+    CONSTRAINT fk_adjustments_inventory
+        FOREIGN KEY (inventory_id) REFERENCES inventory(inventory_id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Index for audit queries
+CREATE INDEX idx_adjustments_inventory_id ON inventory_adjustments(inventory_id);
+CREATE INDEX idx_adjustments_adjusted_at ON inventory_adjustments(adjusted_at);
+
+-- ============================
+-- Views (Optional - for convenience)
+-- ============================
+
+-- View: Products with Inventory Status
+CREATE VIEW v_products_inventory AS
+SELECT
+    p.product_id,
+    p.sku,
+    p.name,
+    p.description,
+    p.price,
+    p.category,
+    p.brand,
+    p.is_active,
+    COALESCE(i.quantity, 0) AS quantity,
+    COALESCE(i.reserved_quantity, 0) AS reserved_quantity,
+    COALESCE(i.quantity - i.reserved_quantity, 0) AS available_quantity,
+    i.warehouse_location,
+    i.reorder_level,
+    i.reorder_quantity,
+    CASE
+        WHEN i.reorder_level IS NOT NULL AND i.quantity <= i.reorder_level THEN TRUE
+        ELSE FALSE
+    END AS needs_reorder,
+    i.last_restocked_at,
+    p.created_at,
+    p.updated_at
+FROM products p
+LEFT JOIN inventory i ON p.product_id = i.product_id;
+
+-- View: Low Stock Items
+CREATE VIEW v_low_stock_items AS
+SELECT
+    p.product_id,
+    p.sku,
+    p.name,
+    i.quantity,
+    i.reorder_level,
+    i.warehouse_location
+FROM products p
+INNER JOIN inventory i ON p.product_id = i.product_id
+WHERE i.reorder_level IS NOT NULL
+  AND i.quantity <= i.reorder_level
+  AND p.is_active = TRUE;
+
+-- ============================
+-- Sample Data (Optional - for testing)
+-- ============================
+
+-- Insert sample products
+INSERT INTO products (product_id, sku, name, description, price, category, brand, is_active)
+VALUES
+    ('11111111-1111-4111-8111-111111111111', 'PROD-12345', 'Wireless Mouse', 'Ergonomic wireless mouse with USB receiver', 29.99, 'Electronics', 'TechCorp', TRUE),
+    ('22222222-2222-4222-8222-222222222222', 'KEYB-5678', 'Mechanical Keyboard', 'RGB backlit mechanical keyboard with blue switches', 89.99, 'Electronics', 'TechCorp', TRUE),
+    ('33333333-3333-4333-8333-333333333333', 'MON-9012', '27" Monitor', '4K UHD monitor with HDR support', 399.99, 'Electronics', 'ViewTech', TRUE);
+
+-- Insert sample inventory
+INSERT INTO inventory (inventory_id, product_id, quantity, warehouse_location, reorder_level, reorder_quantity, reserved_quantity)
+VALUES
+    ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '11111111-1111-4111-8111-111111111111', 150, 'A-12-05', 20, 100, 10),
+    ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '22222222-2222-4222-8222-222222222222', 75, 'B-03-12', 15, 50, 5),
+    ('cccccccc-cccc-4ccc-8ccc-cccccccccccc', '33333333-3333-4333-8333-333333333333', 30, 'C-01-08', 10, 25, 2);

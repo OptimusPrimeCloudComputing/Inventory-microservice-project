@@ -3,16 +3,20 @@ from __future__ import annotations
 import os
 import socket
 from datetime import datetime
+from decimal import Decimal
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
-from fastapi import Query, Path
-from typing import Optional
+from fastapi import FastAPI, HTTPException, Query, Path
 
-from models.person import PersonCreate, PersonRead, PersonUpdate
-from models.address import AddressCreate, AddressRead, AddressUpdate
+from models.product import ProductCreate, ProductRead, ProductUpdate
+from models.inventory import (
+    InventoryCreate,
+    InventoryRead,
+    InventoryUpdate,
+    InventoryAdjustment,
+)
 from models.health import Health
 
 port = int(os.environ.get("FASTAPIPORT", 8000))
@@ -20,156 +24,355 @@ port = int(os.environ.get("FASTAPIPORT", 8000))
 # -----------------------------------------------------------------------------
 # Fake in-memory "databases"
 # -----------------------------------------------------------------------------
-persons: Dict[UUID, PersonRead] = {}
-addresses: Dict[UUID, AddressRead] = {}
+products: Dict[UUID, ProductRead] = {}
+inventories: Dict[UUID, InventoryRead] = {}
+
+# Maximum warehouse capacity (configurable)
+MAX_WAREHOUSE_CAPACITY = int(os.environ.get("MAX_WAREHOUSE_CAPACITY", 10000))
 
 app = FastAPI(
-    title="Person/Address API",
-    description="Demo FastAPI app using Pydantic v2 models for Person and Address",
-    version="0.1.0",
+    title="Inventory Management API",
+    description="FastAPI microservice for managing products and inventory",
+    version="1.0.0",
 )
 
+
 # -----------------------------------------------------------------------------
-# Address endpoints
+# Health endpoints
 # -----------------------------------------------------------------------------
 
-def make_health(echo: Optional[str], path_echo: Optional[str]=None) -> Health:
+
+def make_health(echo: Optional[str], path_echo: Optional[str] = None) -> Health:
     return Health(
         status=200,
         status_message="OK",
         timestamp=datetime.utcnow().isoformat() + "Z",
         ip_address=socket.gethostbyname(socket.gethostname()),
         echo=echo,
-        path_echo=path_echo
+        path_echo=path_echo,
     )
+
 
 @app.get("/health", response_model=Health)
 def get_health_no_path(echo: str | None = Query(None, description="Optional echo string")):
-    # Works because path_echo is optional in the model
     return make_health(echo=echo, path_echo=None)
+
 
 @app.get("/health/{path_echo}", response_model=Health)
 def get_health_with_path(
-    path_echo: str = Path(..., description="Required echo in the URL path"),
-    echo: str | None = Query(None, description="Optional echo string"),
+        path_echo: str = Path(..., description="Required echo in the URL path"),
+        echo: str | None = Query(None, description="Optional echo string"),
 ):
     return make_health(echo=echo, path_echo=path_echo)
 
-@app.post("/addresses", response_model=AddressRead, status_code=201)
-def create_address(address: AddressCreate):
-    if address.id in addresses:
-        raise HTTPException(status_code=400, detail="Address with this ID already exists")
-    addresses[address.id] = AddressRead(**address.model_dump())
-    return addresses[address.id]
 
-@app.get("/addresses", response_model=List[AddressRead])
-def list_addresses(
-    street: Optional[str] = Query(None, description="Filter by street"),
-    city: Optional[str] = Query(None, description="Filter by city"),
-    state: Optional[str] = Query(None, description="Filter by state/region"),
-    postal_code: Optional[str] = Query(None, description="Filter by postal code"),
-    country: Optional[str] = Query(None, description="Filter by country"),
+# -----------------------------------------------------------------------------
+# Product endpoints
+# -----------------------------------------------------------------------------
+
+
+@app.post("/products", response_model=ProductRead, status_code=201)
+def create_product(product: ProductCreate):
+    """Create a new product."""
+    # Check if SKU already exists
+    for p in products.values():
+        if p.sku == product.sku:
+            raise HTTPException(status_code=400, detail=f"Product with SKU '{product.sku}' already exists")
+
+    new_product = ProductRead(**product.model_dump())
+    products[new_product.id] = new_product
+    return new_product
+
+
+@app.get("/products", response_model=List[ProductRead])
+def list_products(
+        sku: Optional[str] = Query(None, description="Filter by SKU"),
+        name: Optional[str] = Query(None, description="Filter by name (contains)"),
+        category: Optional[str] = Query(None, description="Filter by category"),
+        brand: Optional[str] = Query(None, description="Filter by brand"),
+        is_active: Optional[bool] = Query(None, description="Filter by active status"),
+        min_price: Optional[Decimal] = Query(None, description="Minimum price"),
+        max_price: Optional[Decimal] = Query(None, description="Maximum price"),
 ):
-    results = list(addresses.values())
+    """List all products with optional filters."""
+    results = list(products.values())
 
-    if street is not None:
-        results = [a for a in results if a.street == street]
-    if city is not None:
-        results = [a for a in results if a.city == city]
-    if state is not None:
-        results = [a for a in results if a.state == state]
-    if postal_code is not None:
-        results = [a for a in results if a.postal_code == postal_code]
-    if country is not None:
-        results = [a for a in results if a.country == country]
+    if sku:
+        results = [p for p in results if p.sku == sku]
+    if name:
+        results = [p for p in results if name.lower() in p.name.lower()]
+    if category:
+        results = [p for p in results if p.category and category.lower() in p.category.lower()]
+    if brand:
+        results = [p for p in results if p.brand and brand.lower() in p.brand.lower()]
+    if is_active is not None:
+        results = [p for p in results if p.is_active == is_active]
+    if min_price is not None:
+        results = [p for p in results if p.price >= min_price]
+    if max_price is not None:
+        results = [p for p in results if p.price <= max_price]
 
     return results
 
-@app.get("/addresses/{address_id}", response_model=AddressRead)
-def get_address(address_id: UUID):
-    if address_id not in addresses:
-        raise HTTPException(status_code=404, detail="Address not found")
-    return addresses[address_id]
 
-@app.patch("/addresses/{address_id}", response_model=AddressRead)
-def update_address(address_id: UUID, update: AddressUpdate):
-    if address_id not in addresses:
-        raise HTTPException(status_code=404, detail="Address not found")
-    stored = addresses[address_id].model_dump()
-    stored.update(update.model_dump(exclude_unset=True))
-    addresses[address_id] = AddressRead(**stored)
-    return addresses[address_id]
+@app.get("/products/{product_id}", response_model=ProductRead)
+def get_product(product_id: UUID = Path(..., description="Product ID")):
+    """Get a specific product by ID."""
+    if product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return products[product_id]
 
-# -----------------------------------------------------------------------------
-# Person endpoints
-# -----------------------------------------------------------------------------
-@app.post("/persons", response_model=PersonRead, status_code=201)
-def create_person(person: PersonCreate):
-    # Each person gets its own UUID; stored as PersonRead
-    person_read = PersonRead(**person.model_dump())
-    persons[person_read.id] = person_read
-    return person_read
 
-@app.get("/persons", response_model=List[PersonRead])
-def list_persons(
-    uni: Optional[str] = Query(None, description="Filter by Columbia UNI"),
-    first_name: Optional[str] = Query(None, description="Filter by first name"),
-    last_name: Optional[str] = Query(None, description="Filter by last name"),
-    email: Optional[str] = Query(None, description="Filter by email"),
-    phone: Optional[str] = Query(None, description="Filter by phone number"),
-    birth_date: Optional[str] = Query(None, description="Filter by date of birth (YYYY-MM-DD)"),
-    city: Optional[str] = Query(None, description="Filter by city of at least one address"),
-    country: Optional[str] = Query(None, description="Filter by country of at least one address"),
+@app.patch("/products/{product_id}", response_model=ProductRead)
+def update_product(
+        product_id: UUID = Path(..., description="Product ID"),
+        product_update: ProductUpdate = None,
 ):
-    results = list(persons.values())
+    """Update a product (partial update)."""
+    if product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
 
-    if uni is not None:
-        results = [p for p in results if p.uni == uni]
-    if first_name is not None:
-        results = [p for p in results if p.first_name == first_name]
-    if last_name is not None:
-        results = [p for p in results if p.last_name == last_name]
-    if email is not None:
-        results = [p for p in results if p.email == email]
-    if phone is not None:
-        results = [p for p in results if p.phone == phone]
-    if birth_date is not None:
-        results = [p for p in results if str(p.birth_date) == birth_date]
+    existing = products[product_id]
+    update_data = product_update.model_dump(exclude_unset=True)
 
-    # nested address filtering
-    if city is not None:
-        results = [p for p in results if any(addr.city == city for addr in p.addresses)]
-    if country is not None:
-        results = [p for p in results if any(addr.country == country for addr in p.addresses)]
+    # Check if SKU is being changed and if new SKU already exists
+    if "sku" in update_data and update_data["sku"] != existing.sku:
+        for p in products.values():
+            if p.sku == update_data["sku"] and p.id != product_id:
+                raise HTTPException(status_code=400, detail=f"Product with SKU '{update_data['sku']}' already exists")
+
+    # Update fields
+    for field, value in update_data.items():
+        setattr(existing, field, value)
+
+    existing.updated_at = datetime.utcnow()
+    products[product_id] = existing
+    return existing
+
+
+@app.delete("/products/{product_id}", status_code=204)
+def delete_product(product_id: UUID = Path(..., description="Product ID")):
+    """Delete a product."""
+    if product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Check if product has inventory
+    for inv in inventories.values():
+        if inv.product_id == product_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete product with existing inventory. Remove inventory first.",
+            )
+
+    del products[product_id]
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Inventory endpoints
+# -----------------------------------------------------------------------------
+
+
+@app.post("/inventory", response_model=InventoryRead, status_code=201)
+def create_inventory(inventory: InventoryCreate):
+    """Create a new inventory record for a product."""
+    # Check if product exists
+    if inventory.product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Check if inventory already exists for this product
+    for inv in inventories.values():
+        if inv.product_id == inventory.product_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Inventory record already exists for this product",
+            )
+
+    # Check warehouse capacity
+    current_total = sum(inv.quantity for inv in inventories.values())
+    if current_total + inventory.quantity > MAX_WAREHOUSE_CAPACITY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Exceeds warehouse capacity. Current: {current_total}, Available: {MAX_WAREHOUSE_CAPACITY - current_total}",
+        )
+
+    # Create inventory record
+    available = inventory.quantity - inventory.reserved_quantity
+    needs_reorder = (
+        inventory.quantity <= inventory.reorder_level
+        if inventory.reorder_level is not None
+        else False
+    )
+
+    new_inventory = InventoryRead(
+        **inventory.model_dump(),
+        available_quantity=available,
+        needs_reorder=needs_reorder,
+        last_restocked_at=datetime.utcnow(),
+    )
+    inventories[new_inventory.id] = new_inventory
+    return new_inventory
+
+
+@app.get("/inventory", response_model=List[InventoryRead])
+def list_inventory(
+        product_id: Optional[UUID] = Query(None, description="Filter by product ID"),
+        warehouse_location: Optional[str] = Query(None, description="Filter by warehouse location"),
+        needs_reorder: Optional[bool] = Query(None, description="Filter items needing reorder"),
+        low_stock: Optional[bool] = Query(None, description="Show items with quantity < 10"),
+):
+    """List all inventory records with optional filters."""
+    results = list(inventories.values())
+
+    if product_id:
+        results = [inv for inv in results if inv.product_id == product_id]
+    if warehouse_location:
+        results = [inv for inv in results if
+                   inv.warehouse_location and warehouse_location.lower() in inv.warehouse_location.lower()]
+    if needs_reorder is not None:
+        results = [inv for inv in results if inv.needs_reorder == needs_reorder]
+    if low_stock:
+        results = [inv for inv in results if inv.quantity < 10]
 
     return results
 
-@app.get("/persons/{person_id}", response_model=PersonRead)
-def get_person(person_id: UUID):
-    if person_id not in persons:
-        raise HTTPException(status_code=404, detail="Person not found")
-    return persons[person_id]
 
-@app.patch("/persons/{person_id}", response_model=PersonRead)
-def update_person(person_id: UUID, update: PersonUpdate):
-    if person_id not in persons:
-        raise HTTPException(status_code=404, detail="Person not found")
-    stored = persons[person_id].model_dump()
-    stored.update(update.model_dump(exclude_unset=True))
-    persons[person_id] = PersonRead(**stored)
-    return persons[person_id]
+@app.get("/inventory/{inventory_id}", response_model=InventoryRead)
+def get_inventory(inventory_id: UUID = Path(..., description="Inventory ID")):
+    """Get a specific inventory record by ID."""
+    if inventory_id not in inventories:
+        raise HTTPException(status_code=404, detail="Inventory record not found")
+    return inventories[inventory_id]
+
+
+@app.get("/inventory/product/{product_id}", response_model=InventoryRead)
+def get_inventory_by_product(product_id: UUID = Path(..., description="Product ID")):
+    """Get inventory record for a specific product."""
+    for inv in inventories.values():
+        if inv.product_id == product_id:
+            return inv
+    raise HTTPException(status_code=404, detail="Inventory record not found for this product")
+
+
+@app.patch("/inventory/{inventory_id}", response_model=InventoryRead)
+def update_inventory(
+        inventory_id: UUID = Path(..., description="Inventory ID"),
+        inventory_update: InventoryUpdate = None,
+):
+    """Update an inventory record (partial update)."""
+    if inventory_id not in inventories:
+        raise HTTPException(status_code=404, detail="Inventory record not found")
+
+    existing = inventories[inventory_id]
+    update_data = inventory_update.model_dump(exclude_unset=True)
+
+    # Check warehouse capacity if quantity is being updated
+    if "quantity" in update_data:
+        current_total = sum(inv.quantity for inv in inventories.values() if inv.id != inventory_id)
+        if current_total + update_data["quantity"] > MAX_WAREHOUSE_CAPACITY:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Exceeds warehouse capacity. Current: {current_total}, Available: {MAX_WAREHOUSE_CAPACITY - current_total}",
+            )
+
+    # Update fields
+    for field, value in update_data.items():
+        setattr(existing, field, value)
+
+    # Recalculate computed fields
+    existing.available_quantity = existing.quantity - existing.reserved_quantity
+    existing.needs_reorder = (
+        existing.quantity <= existing.reorder_level
+        if existing.reorder_level is not None
+        else False
+    )
+    existing.updated_at = datetime.utcnow()
+
+    inventories[inventory_id] = existing
+    return existing
+
+
+@app.post("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
+def adjust_inventory(
+        inventory_id: UUID = Path(..., description="Inventory ID"),
+        adjustment: InventoryAdjustment = None,
+):
+    """Adjust inventory quantity (add or remove stock)."""
+    if inventory_id not in inventories:
+        raise HTTPException(status_code=404, detail="Inventory record not found")
+
+    existing = inventories[inventory_id]
+    new_quantity = existing.quantity + adjustment.adjustment
+
+    if new_quantity < 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient stock. Current: {existing.quantity}, Adjustment: {adjustment.adjustment}",
+        )
+
+    # Check warehouse capacity for positive adjustments
+    if adjustment.adjustment > 0:
+        current_total = sum(inv.quantity for inv in inventories.values() if inv.id != inventory_id)
+        if current_total + new_quantity > MAX_WAREHOUSE_CAPACITY:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Exceeds warehouse capacity. Current: {current_total}, Available: {MAX_WAREHOUSE_CAPACITY - current_total}",
+            )
+
+    existing.quantity = new_quantity
+    existing.available_quantity = existing.quantity - existing.reserved_quantity
+    existing.needs_reorder = (
+        existing.quantity <= existing.reorder_level
+        if existing.reorder_level is not None
+        else False
+    )
+
+    # Update last_restocked_at only for positive adjustments
+    if adjustment.adjustment > 0:
+        existing.last_restocked_at = datetime.utcnow()
+
+    existing.updated_at = datetime.utcnow()
+    inventories[inventory_id] = existing
+    return existing
+
+
+@app.delete("/inventory/{inventory_id}", status_code=204)
+def delete_inventory(inventory_id: UUID = Path(..., description="Inventory ID")):
+    """Delete an inventory record."""
+    if inventory_id not in inventories:
+        raise HTTPException(status_code=404, detail="Inventory record not found")
+
+    del inventories[inventory_id]
+    return None
+
 
 # -----------------------------------------------------------------------------
-# Root
+# Warehouse capacity endpoints
 # -----------------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {"message": "Welcome to the Person/Address API. See /docs for OpenAPI UI."}
+
+
+@app.get("/warehouse/capacity")
+def get_warehouse_capacity():
+    """Get current warehouse capacity status."""
+    current_total = sum(inv.quantity for inv in inventories.values())
+    available = MAX_WAREHOUSE_CAPACITY - current_total
+    utilization_percentage = (current_total / MAX_WAREHOUSE_CAPACITY) * 100 if MAX_WAREHOUSE_CAPACITY > 0 else 0
+
+    return {
+        "max_capacity": MAX_WAREHOUSE_CAPACITY,
+        "current_total": current_total,
+        "available_capacity": available,
+        "utilization_percentage": round(utilization_percentage, 2),
+        "is_full": current_total >= MAX_WAREHOUSE_CAPACITY,
+        "items_count": len(inventories),
+    }
+
 
 # -----------------------------------------------------------------------------
-# Entrypoint for `python main.py`
+# Run the app
 # -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
