@@ -7,7 +7,8 @@ from decimal import Decimal
 from pydantic import BaseModel, Field, StringConstraints
 
 # SKU pattern: alphanumeric with hyphens (e.g., PROD-12345)
-SKUType = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9\-]{3,20}$")]
+# Updated to support up to 50 characters for e-commerce flexibility
+SKUType = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9\-]{3,50}$")]
 
 
 class ProductBase(BaseModel):
@@ -50,7 +51,7 @@ class ProductBase(BaseModel):
     )
     is_active: bool = Field(
         default=True,
-        description="Whether the product is currently active/available.",
+        description="Whether the product is currently active/available for sale.",
         json_schema_extra={"example": True},
     )
 
