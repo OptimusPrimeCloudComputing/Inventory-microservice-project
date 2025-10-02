@@ -14,13 +14,13 @@ class InventoryBase(BaseModel):
     )
     quantity: int = Field(
         ...,
-        description="Current stock quantity.",
+        description="Current stock quantity (unlimited capacity for online store).",
         ge=0,
         json_schema_extra={"example": 150},
     )
     warehouse_location: Optional[str] = Field(
         None,
-        description="Physical location in warehouse (aisle, bin, shelf, etc.).",
+        description="Physical location in warehouse or fulfillment center (optional for drop-shipped items).",
         max_length=100,
         json_schema_extra={"example": "A-12-05"},
     )
@@ -38,7 +38,7 @@ class InventoryBase(BaseModel):
     )
     reserved_quantity: int = Field(
         default=0,
-        description="Quantity reserved for pending orders (not available for sale).",
+        description="Quantity reserved for pending orders or items in shopping carts (not available for sale).",
         ge=0,
         json_schema_extra={"example": 10},
     )
@@ -70,6 +70,14 @@ class InventoryCreate(InventoryBase):
                     "warehouse_location": "B-03-12",
                     "reorder_level": 30,
                     "reorder_quantity": 150,
+                    "reserved_quantity": 0,
+                },
+                {
+                    "product_id": "33333333-3333-4333-8333-333333333333",
+                    "quantity": 5000,
+                    "warehouse_location": None,  # Drop-shipped item
+                    "reorder_level": 100,
+                    "reorder_quantity": 1000,
                     "reserved_quantity": 0,
                 }
             ]
@@ -130,7 +138,7 @@ class InventoryRead(InventoryBase):
     )
     available_quantity: int = Field(
         ...,
-        description="Calculated available quantity (quantity - reserved_quantity).",
+        description="Calculated available quantity (quantity - reserved_quantity). This is what customers can actually purchase.",
         json_schema_extra={"example": 140},
     )
     needs_reorder: bool = Field(
@@ -180,12 +188,12 @@ class InventoryAdjustment(BaseModel):
     """Payload for adjusting inventory quantity (add/remove stock)."""
     adjustment: int = Field(
         ...,
-        description="Quantity to add (positive) or remove (negative) from inventory.",
+        description="Quantity to add (positive) or remove (negative) from inventory. No upper limit for restocks.",
         json_schema_extra={"example": 50},
     )
     reason: Optional[str] = Field(
         None,
-        description="Reason for the adjustment (restock, sale, damage, etc.).",
+        description="Reason for the adjustment (restock, sale, damage, return, etc.).",
         max_length=200,
         json_schema_extra={"example": "Restock from supplier"},
     )
@@ -195,6 +203,8 @@ class InventoryAdjustment(BaseModel):
             "examples": [
                 {"adjustment": 100, "reason": "Restock from supplier"},
                 {"adjustment": -5, "reason": "Damaged items removed"},
+                {"adjustment": 10, "reason": "Customer return processed"},
+                {"adjustment": 1000, "reason": "Bulk order from manufacturer"},
             ]
         }
     }
