@@ -27,12 +27,9 @@ port = int(os.environ.get("FASTAPIPORT", 8000))
 products: Dict[UUID, ProductRead] = {}
 inventories: Dict[UUID, InventoryRead] = {}
 
-# Maximum warehouse capacity (configurable)
-MAX_WAREHOUSE_CAPACITY = int(os.environ.get("MAX_WAREHOUSE_CAPACITY", 10000))
-
 app = FastAPI(
-    title="Inventory Management API",
-    description="FastAPI microservice for managing products and inventory",
+    title="E-commerce Inventory Management API",
+    description="FastAPI microservice for managing products and inventory for an online store",
     version="1.0.0",
 )
 
@@ -188,14 +185,6 @@ def create_inventory(inventory: InventoryCreate):
                 detail="Inventory record already exists for this product",
             )
 
-    # Check warehouse capacity
-    current_total = sum(inv.quantity for inv in inventories.values())
-    if current_total + inventory.quantity > MAX_WAREHOUSE_CAPACITY:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Exceeds warehouse capacity. Current: {current_total}, Available: {MAX_WAREHOUSE_CAPACITY - current_total}",
-        )
-
     # Create inventory record
     available = inventory.quantity - inventory.reserved_quantity
     needs_reorder = (
@@ -266,15 +255,6 @@ def update_inventory(
     existing = inventories[inventory_id]
     update_data = inventory_update.model_dump(exclude_unset=True)
 
-    # Check warehouse capacity if quantity is being updated
-    if "quantity" in update_data:
-        current_total = sum(inv.quantity for inv in inventories.values() if inv.id != inventory_id)
-        if current_total + update_data["quantity"] > MAX_WAREHOUSE_CAPACITY:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Exceeds warehouse capacity. Current: {current_total}, Available: {MAX_WAREHOUSE_CAPACITY - current_total}",
-            )
-
     # Update fields
     for field, value in update_data.items():
         setattr(existing, field, value)
@@ -310,15 +290,6 @@ def adjust_inventory(
             detail=f"Insufficient stock. Current: {existing.quantity}, Adjustment: {adjustment.adjustment}",
         )
 
-    # Check warehouse capacity for positive adjustments
-    if adjustment.adjustment > 0:
-        current_total = sum(inv.quantity for inv in inventories.values() if inv.id != inventory_id)
-        if current_total + new_quantity > MAX_WAREHOUSE_CAPACITY:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Exceeds warehouse capacity. Current: {current_total}, Available: {MAX_WAREHOUSE_CAPACITY - current_total}",
-            )
-
     existing.quantity = new_quantity
     existing.available_quantity = existing.quantity - existing.reserved_quantity
     existing.needs_reorder = (
@@ -347,24 +318,27 @@ def delete_inventory(inventory_id: UUID = Path(..., description="Inventory ID"))
 
 
 # -----------------------------------------------------------------------------
-# Warehouse capacity endpoints
+# Inventory statistics endpoints
 # -----------------------------------------------------------------------------
 
 
-@app.get("/warehouse/capacity")
-def get_warehouse_capacity():
-    """Get current warehouse capacity status."""
-    current_total = sum(inv.quantity for inv in inventories.values())
-    available = MAX_WAREHOUSE_CAPACITY - current_total
-    utilization_percentage = (current_total / MAX_WAREHOUSE_CAPACITY) * 100 if MAX_WAREHOUSE_CAPACITY > 0 else 0
+@app.get("/inventory/stats/summary")
+def get_inventory_summary():
+    """Get summary statistics for all inventory."""
+    total_products = len(inventories)
+    total_quantity = sum(inv.quantity for inv in inventories.values())
+    total_reserved = sum(inv.reserved_quantity for inv in inventories.values())
+    total_available = sum(inv.available_quantity for inv in inventories.values())
+    items_needing_reorder = sum(1 for inv in inventories.values() if inv.needs_reorder)
+    low_stock_items = sum(1 for inv in inventories.values() if inv.quantity < 10)
 
     return {
-        "max_capacity": MAX_WAREHOUSE_CAPACITY,
-        "current_total": current_total,
-        "available_capacity": available,
-        "utilization_percentage": round(utilization_percentage, 2),
-        "is_full": current_total >= MAX_WAREHOUSE_CAPACITY,
-        "items_count": len(inventories),
+        "total_products": total_products,
+        "total_quantity": total_quantity,
+        "total_reserved": total_reserved,
+        "total_available": total_available,
+        "items_needing_reorder": items_needing_reorder,
+        "low_stock_items": low_stock_items,
     }
 
 
