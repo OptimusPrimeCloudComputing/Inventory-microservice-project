@@ -34,6 +34,9 @@ if __name__ == "__main__":
             cursor.execute("SELECT DATABASE();")
             db_in_use = cursor.fetchone()
             print("Current database:", db_in_use)
+            cursor.execute("SELECT * FROM products;")
+            products = cursor.fetchall()
+            print("Products:", products)
 
     except Exception as e:
         print("❌ Connection failed:", e)
