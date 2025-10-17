@@ -18,6 +18,57 @@ from models.inventory import (
     InventoryAdjustment,
 )
 from models.health import Health
+from db import get_connection
+import pymysql
+
+
+def _to_int(v):
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return v
+
+
+def row_to_inventory_read(row: dict) -> InventoryRead:
+    """
+    Convert a SQL row from the `inventory` table (DictCursor) into InventoryRead.
+    Assumes SELECT included computed columns:
+      - available_quantity
+      - needs_reorder
+    """
+    if not row:
+        return None
+
+    available = row.get("available_quantity")
+    if available is None and row.get("quantity") is not None and row.get("reserved_quantity") is not None:
+        available = _to_int(row["quantity"]) - \
+            _to_int(row["reserved_quantity"])
+
+    needs = row.get("needs_reorder")
+    if needs is None:
+        rl = row.get("reorder_level")
+        needs = bool(rl is not None and _to_int(
+            row["quantity"]) <= _to_int(rl))
+    else:
+        needs = bool(needs)
+
+    return InventoryRead(
+        id=UUID(str(row["inventory_id"])),
+        product_id=UUID(str(row["product_id"])),
+        quantity=_to_int(row["quantity"]),
+        warehouse_location=row.get("warehouse_location"),
+        reorder_level=_to_int(row.get("reorder_level")),
+        reorder_quantity=_to_int(row.get("reorder_quantity")),
+        reserved_quantity=_to_int(row.get("reserved_quantity", 0)),
+        available_quantity=_to_int(available),
+        needs_reorder=needs,
+        last_restocked_at=row.get("last_restocked_at"),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
 
 port = int(os.environ.get("FASTAPIPORT", 8000))
 
@@ -57,7 +108,8 @@ def get_health_no_path(echo: str | None = Query(None, description="Optional echo
 
 @app.get("/health/{path_echo}", response_model=Health)
 def get_health_with_path(
-        path_echo: str = Path(..., description="Required echo in the URL path"),
+        path_echo: str = Path(...,
+                              description="Required echo in the URL path"),
         echo: str | None = Query(None, description="Optional echo string"),
 ):
     return make_health(echo=echo, path_echo=path_echo)
@@ -74,7 +126,8 @@ def create_product(product: ProductCreate):
     # Check if SKU already exists
     for p in products.values():
         if p.sku == product.sku:
-            raise HTTPException(status_code=400, detail=f"Product with SKU '{product.sku}' already exists")
+            raise HTTPException(
+                status_code=400, detail=f"Product with SKU '{product.sku}' already exists")
 
     new_product = ProductRead(**product.model_dump())
     products[new_product.id] = new_product
@@ -84,12 +137,17 @@ def create_product(product: ProductCreate):
 @app.get("/products", response_model=List[ProductRead])
 def list_products(
         sku: Optional[str] = Query(None, description="Filter by SKU"),
-        name: Optional[str] = Query(None, description="Filter by name (contains)"),
-        category: Optional[str] = Query(None, description="Filter by category"),
+        name: Optional[str] = Query(
+            None, description="Filter by name (contains)"),
+        category: Optional[str] = Query(
+            None, description="Filter by category"),
         brand: Optional[str] = Query(None, description="Filter by brand"),
-        is_active: Optional[bool] = Query(None, description="Filter by active status"),
-        min_price: Optional[Decimal] = Query(None, description="Minimum price"),
-        max_price: Optional[Decimal] = Query(None, description="Maximum price"),
+        is_active: Optional[bool] = Query(
+            None, description="Filter by active status"),
+        min_price: Optional[Decimal] = Query(
+            None, description="Minimum price"),
+        max_price: Optional[Decimal] = Query(
+            None, description="Maximum price"),
 ):
     """List all products with optional filters."""
     results = list(products.values())
@@ -99,9 +157,11 @@ def list_products(
     if name:
         results = [p for p in results if name.lower() in p.name.lower()]
     if category:
-        results = [p for p in results if p.category and category.lower() in p.category.lower()]
+        results = [p for p in results if p.category and category.lower()
+                   in p.category.lower()]
     if brand:
-        results = [p for p in results if p.brand and brand.lower() in p.brand.lower()]
+        results = [p for p in results if p.brand and brand.lower()
+                   in p.brand.lower()]
     if is_active is not None:
         results = [p for p in results if p.is_active == is_active]
     if min_price is not None:
@@ -136,7 +196,8 @@ def update_product(
     if "sku" in update_data and update_data["sku"] != existing.sku:
         for p in products.values():
             if p.sku == update_data["sku"] and p.id != product_id:
-                raise HTTPException(status_code=400, detail=f"Product with SKU '{update_data['sku']}' already exists")
+                raise HTTPException(
+                    status_code=400, detail=f"Product with SKU '{update_data['sku']}' already exists")
 
     # Update fields
     for field, value in update_data.items():
@@ -173,147 +234,208 @@ def delete_product(product_id: UUID = Path(..., description="Product ID")):
 @app.post("/inventory", response_model=InventoryRead, status_code=201)
 def create_inventory(inventory: InventoryCreate):
     """Create a new inventory record for a product."""
-    # Check if product exists
-    if inventory.product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM products WHERE product_id=%s",
+                        (str(inventory.product_id),))
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=404, detail="Product not found")
 
-    # Check if inventory already exists for this product
-    for inv in inventories.values():
-        if inv.product_id == inventory.product_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Inventory record already exists for this product",
-            )
+            cur.execute("SELECT 1 FROM inventory WHERE product_id=%s",
+                        (str(inventory.product_id),))
+            if cur.fetchone():
+                raise HTTPException(
+                    status_code=400, detail="Inventory record already exists for this product")
 
-    # Create inventory record
-    available = inventory.quantity - inventory.reserved_quantity
-    needs_reorder = (
-        inventory.quantity <= inventory.reorder_level
-        if inventory.reorder_level is not None
-        else False
-    )
+            cur.execute("""
+                INSERT INTO inventory (
+                    inventory_id, product_id, quantity, warehouse_location,
+                    reorder_level, reorder_quantity, reserved_quantity,
+                    last_restocked_at, created_at, updated_at
+                )
+                VALUES (UUID(), %s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
+            """, (
+                str(inventory.product_id),
+                inventory.quantity,
+                inventory.warehouse_location,
+                inventory.reorder_level,
+                inventory.reorder_quantity,
+                inventory.reserved_quantity
+            ))
+            conn.commit()
 
-    new_inventory = InventoryRead(
-        **inventory.model_dump(),
-        available_quantity=available,
-        needs_reorder=needs_reorder,
-        last_restocked_at=datetime.utcnow(),
-    )
-    inventories[new_inventory.id] = new_inventory
-    return new_inventory
+            cur.execute("""
+                SELECT *,
+                       (quantity - reserved_quantity) AS available_quantity,
+                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                FROM inventory
+                WHERE product_id=%s
+            """, (str(inventory.product_id),))
+            row = cur.fetchone()
+            return row_to_inventory_read(row)
 
 
 @app.get("/inventory", response_model=List[InventoryRead])
 def list_inventory(
-        product_id: Optional[UUID] = Query(None, description="Filter by product ID"),
-        warehouse_location: Optional[str] = Query(None, description="Filter by warehouse location"),
-        needs_reorder: Optional[bool] = Query(None, description="Filter items needing reorder"),
-        low_stock: Optional[bool] = Query(None, description="Show items with quantity < 10"),
+    product_id: Optional[UUID] = Query(None),
+    warehouse_location: Optional[str] = Query(None),
+    needs_reorder: Optional[bool] = Query(None),
+    low_stock: Optional[bool] = Query(None),
 ):
     """List all inventory records with optional filters."""
-    results = list(inventories.values())
+    sql = """
+        SELECT *,
+               (quantity - reserved_quantity) AS available_quantity,
+               (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+        FROM inventory
+    """
+    where = []
+    params = []
 
     if product_id:
-        results = [inv for inv in results if inv.product_id == product_id]
+        where.append("product_id = %s")
+        params.append(str(product_id))
     if warehouse_location:
-        results = [inv for inv in results if
-                   inv.warehouse_location and warehouse_location.lower() in inv.warehouse_location.lower()]
+        where.append("warehouse_location LIKE %s")
+        params.append(f"%{warehouse_location}%")
     if needs_reorder is not None:
-        results = [inv for inv in results if inv.needs_reorder == needs_reorder]
+        where.append(
+            "(reorder_level IS NOT NULL AND quantity <= reorder_level) = %s")
+        params.append(1 if needs_reorder else 0)
     if low_stock:
-        results = [inv for inv in results if inv.quantity < 10]
+        where.append("quantity < 10")
 
-    return results
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC"
+
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [row_to_inventory_read(r) for r in rows]
 
 
 @app.get("/inventory/{inventory_id}", response_model=InventoryRead)
-def get_inventory(inventory_id: UUID = Path(..., description="Inventory ID")):
+def get_inventory(inventory_id: UUID = Path(...)):
     """Get a specific inventory record by ID."""
-    if inventory_id not in inventories:
-        raise HTTPException(status_code=404, detail="Inventory record not found")
-    return inventories[inventory_id]
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT *,
+                   (quantity - reserved_quantity) AS available_quantity,
+                   (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+            FROM inventory
+            WHERE inventory_id=%s
+        """, (str(inventory_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Inventory record not found")
+        return row
 
 
 @app.get("/inventory/product/{product_id}", response_model=InventoryRead)
-def get_inventory_by_product(product_id: UUID = Path(..., description="Product ID")):
+def get_inventory_by_product(product_id: UUID = Path(...)):
     """Get inventory record for a specific product."""
-    for inv in inventories.values():
-        if inv.product_id == product_id:
-            return inv
-    raise HTTPException(status_code=404, detail="Inventory record not found for this product")
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT *,
+                   (quantity - reserved_quantity) AS available_quantity,
+                   (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+            FROM inventory
+            WHERE product_id=%s
+        """, (str(product_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Inventory record not found for this product")
+        return row_to_inventory_read(row)
 
 
 @app.patch("/inventory/{inventory_id}", response_model=InventoryRead)
-def update_inventory(
-        inventory_id: UUID = Path(..., description="Inventory ID"),
-        inventory_update: InventoryUpdate = None,
-):
+def update_inventory(inventory_id: UUID, inventory_update: InventoryUpdate):
     """Update an inventory record (partial update)."""
-    if inventory_id not in inventories:
-        raise HTTPException(status_code=404, detail="Inventory record not found")
-
-    existing = inventories[inventory_id]
     update_data = inventory_update.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Update fields
-    for field, value in update_data.items():
-        setattr(existing, field, value)
+    fields = []
+    params = []
+    for k, v in update_data.items():
+        fields.append(f"{k}=%s")
+        params.append(v)
 
-    # Recalculate computed fields
-    existing.available_quantity = existing.quantity - existing.reserved_quantity
-    existing.needs_reorder = (
-        existing.quantity <= existing.reorder_level
-        if existing.reorder_level is not None
-        else False
-    )
-    existing.updated_at = datetime.utcnow()
+    params.append(str(inventory_id))
 
-    inventories[inventory_id] = existing
-    return existing
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
+            print(sql)
+            cur.execute(sql, params)
+            conn.commit()
+
+            cur.execute("""
+                SELECT *,
+                       (quantity - reserved_quantity) AS available_quantity,
+                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                FROM inventory
+                WHERE inventory_id=%s
+            """, (str(inventory_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail="Inventory record not found")
+            return row_to_inventory_read(row)
 
 
 @app.post("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
-def adjust_inventory(
-        inventory_id: UUID = Path(..., description="Inventory ID"),
-        adjustment: InventoryAdjustment = None,
-):
+def adjust_inventory(inventory_id: UUID, adjustment: InventoryAdjustment):
     """Adjust inventory quantity (add or remove stock)."""
-    if inventory_id not in inventories:
-        raise HTTPException(status_code=404, detail="Inventory record not found")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT quantity, reserved_quantity, reorder_level FROM inventory WHERE inventory_id=%s FOR UPDATE", (str(inventory_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail="Inventory record not found")
 
-    existing = inventories[inventory_id]
-    new_quantity = existing.quantity + adjustment.adjustment
+            new_qty = row["quantity"] + adjustment.adjustment
+            if new_qty < 0:
+                raise HTTPException(
+                    status_code=400, detail="Insufficient stock")
 
-    if new_quantity < 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient stock. Current: {existing.quantity}, Adjustment: {adjustment.adjustment}",
-        )
+            cur.execute("""
+                UPDATE inventory
+                SET quantity=%s,
+                    last_restocked_at = CASE WHEN %s > 0 THEN NOW() ELSE last_restocked_at END,
+                    updated_at=NOW()
+                WHERE inventory_id=%s
+            """, (new_qty, adjustment.adjustment, str(inventory_id)))
+            conn.commit()
 
-    existing.quantity = new_quantity
-    existing.available_quantity = existing.quantity - existing.reserved_quantity
-    existing.needs_reorder = (
-        existing.quantity <= existing.reorder_level
-        if existing.reorder_level is not None
-        else False
-    )
-
-    # Update last_restocked_at only for positive adjustments
-    if adjustment.adjustment > 0:
-        existing.last_restocked_at = datetime.utcnow()
-
-    existing.updated_at = datetime.utcnow()
-    inventories[inventory_id] = existing
-    return existing
+            cur.execute("""
+                SELECT *,
+                       (quantity - reserved_quantity) AS available_quantity,
+                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                FROM inventory
+                WHERE inventory_id=%s
+            """, (str(inventory_id),))
+            row = cur.fetchone()
+            return row_to_inventory_read(row)
 
 
 @app.delete("/inventory/{inventory_id}", status_code=204)
-def delete_inventory(inventory_id: UUID = Path(..., description="Inventory ID")):
+def delete_inventory(inventory_id: UUID):
     """Delete an inventory record."""
-    if inventory_id not in inventories:
-        raise HTTPException(status_code=404, detail="Inventory record not found")
-
-    del inventories[inventory_id]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM inventory WHERE inventory_id=%s",
+                        (str(inventory_id),))
+            if cur.rowcount == 0:
+                raise HTTPException(
+                    status_code=404, detail="Inventory record not found")
+            conn.commit()
     return None
 
 
@@ -324,28 +446,24 @@ def delete_inventory(inventory_id: UUID = Path(..., description="Inventory ID"))
 
 @app.get("/inventory/stats/summary")
 def get_inventory_summary():
-    """Get summary statistics for all inventory."""
-    total_products = len(inventories)
-    total_quantity = sum(inv.quantity for inv in inventories.values())
-    total_reserved = sum(inv.reserved_quantity for inv in inventories.values())
-    total_available = sum(inv.available_quantity for inv in inventories.values())
-    items_needing_reorder = sum(1 for inv in inventories.values() if inv.needs_reorder)
-    low_stock_items = sum(1 for inv in inventories.values() if inv.quantity < 10)
-
-    return {
-        "total_products": total_products,
-        "total_quantity": total_quantity,
-        "total_reserved": total_reserved,
-        "total_available": total_available,
-        "items_needing_reorder": items_needing_reorder,
-        "low_stock_items": low_stock_items,
-    }
+    """Get inventory summary statistics."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total_products,
+                COALESCE(SUM(quantity),0) AS total_quantity,
+                COALESCE(SUM(reserved_quantity),0) AS total_reserved,
+                COALESCE(SUM(quantity - reserved_quantity),0) AS total_available,
+                SUM(CASE WHEN reorder_level IS NOT NULL AND quantity <= reorder_level THEN 1 ELSE 0 END) AS items_needing_reorder,
+                SUM(CASE WHEN quantity < 10 THEN 1 ELSE 0 END) AS low_stock_items
+            FROM inventory
+        """)
+        return cur.fetchone()
 
 
 # -----------------------------------------------------------------------------
 # Run the app
 # -----------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import uvicorn
 
