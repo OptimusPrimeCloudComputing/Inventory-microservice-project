@@ -69,6 +69,26 @@ def row_to_inventory_read(row: dict) -> InventoryRead:
         updated_at=row.get("updated_at"),
     )
 
+def row_to_product_read(row: dict) -> ProductRead:
+    """
+    Convert a SQL row from the `products` table (DictCursor) into ProductRead.
+    """
+    if not row:
+        return None
+
+    return ProductRead(
+        id=UUID(str(row["product_id"])),
+        sku=row.get("sku"),
+        name=row.get("name"),
+        description=row.get("description"),
+        price=Decimal(row.get("price")) if row.get("price") is not None else None,
+        category=row.get("category"),
+        brand=row.get("brand"),
+        is_active=bool(row.get("is_active")),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
 
 port = int(os.environ.get("FASTAPIPORT", 8000))
 
@@ -123,15 +143,39 @@ def get_health_with_path(
 @app.post("/products", response_model=ProductRead, status_code=201)
 def create_product(product: ProductCreate):
     """Create a new product."""
-    # Check if SKU already exists
-    for p in products.values():
-        if p.sku == product.sku:
-            raise HTTPException(
-                status_code=400, detail=f"Product with SKU '{product.sku}' already exists")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM products WHERE product_id=%s",
+                        (str(product.product_id),))
+            if cur.fetchone() is not None:
+                raise HTTPException(
+                    status_code=409, detail="Product already exists")
 
-    new_product = ProductRead(**product.model_dump())
-    products[new_product.id] = new_product
-    return new_product
+            cur.execute("""
+                INSERT INTO products (
+                    product_id, sku, name, description, price, category, brand,
+                    is_active, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """, (
+                str(product.product_id),
+                product.sku,
+                product.name,
+                product.description,
+                product.price,
+                product.category,
+                product.brand,
+                product.is_active
+            ))
+            conn.commit()
+
+            cur.execute("""
+                SELECT *
+                FROM products
+                WHERE product_id=%s
+            """, (str(product.product_id),))
+            row = cur.fetchone()
+            return row_to_product_read(row)
 
 
 @app.get("/products", response_model=List[ProductRead])
@@ -149,35 +193,60 @@ def list_products(
         max_price: Optional[Decimal] = Query(
             None, description="Maximum price"),
 ):
-    """List all products with optional filters."""
-    results = list(products.values())
+    """List all products records with optional filters."""
+    sql = """
+        SELECT *
+        FROM products
+    """
+    where = []
+    params = []
 
     if sku:
-        results = [p for p in results if p.sku == sku]
+        where.append("sku LIKE %s")
+        params.append(f"%{sku}%")
     if name:
-        results = [p for p in results if name.lower() in p.name.lower()]
+        where.append("name LIKE %s")
+        params.append(f"%{name}%")
     if category:
-        results = [p for p in results if p.category and category.lower()
-                   in p.category.lower()]
+        where.append("category LIKE %s")
+        params.append(f"%{category}%")
     if brand:
-        results = [p for p in results if p.brand and brand.lower()
-                   in p.brand.lower()]
+        where.append("brand LIKE %s")
+        params.append(f"%{brand}%")
     if is_active is not None:
-        results = [p for p in results if p.is_active == is_active]
+        where.append("is_active = %s")
+        params.append(1 if is_active else 0)
     if min_price is not None:
-        results = [p for p in results if p.price >= min_price]
+        where.append("price >= %s")
+        params.append(min_price)
     if max_price is not None:
-        results = [p for p in results if p.price <= max_price]
+        where.append("price <= %s")
+        params.append(max_price)
 
-    return results
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC"
+
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [row_to_product_read(r) for r in rows]
 
 
 @app.get("/products/{product_id}", response_model=ProductRead)
 def get_product(product_id: UUID = Path(..., description="Product ID")):
     """Get a specific product by ID."""
-    if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return products[product_id]
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT *,
+            FROM products
+            WHERE product_id=%s
+        """, (str(product_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Product not found")
+        return row
 
 
 @app.patch("/products/{product_id}", response_model=ProductRead)
@@ -185,13 +254,12 @@ def update_product(
         product_id: UUID = Path(..., description="Product ID"),
         product_update: ProductUpdate = None,
 ):
-    """Update a product (partial update)."""
-    if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
-
+    """Update a product record (partial update)."""
     existing = products[product_id]
     update_data = product_update.model_dump(exclude_unset=True)
-
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
     # Check if SKU is being changed and if new SKU already exists
     if "sku" in update_data and update_data["sku"] != existing.sku:
         for p in products.values():
@@ -199,30 +267,44 @@ def update_product(
                 raise HTTPException(
                     status_code=400, detail=f"Product with SKU '{update_data['sku']}' already exists")
 
-    # Update fields
-    for field, value in update_data.items():
-        setattr(existing, field, value)
+    fields = []
+    params = []
+    for k, v in update_data.items():
+        fields.append(f"{k}=%s")
+        params.append(v)
 
-    existing.updated_at = datetime.utcnow()
-    products[product_id] = existing
-    return existing
+    params.append(str(product_id))
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
+            print(sql)
+            cur.execute(sql, params)
+            conn.commit()
+
+            cur.execute("""
+                SELECT *,
+                FROM products
+                WHERE product_id=%s
+            """, (str(product_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail="Product not found")
+            return row_to_product_read(row)
 
 
 @app.delete("/products/{product_id}", status_code=204)
 def delete_product(product_id: UUID = Path(..., description="Product ID")):
-    """Delete a product."""
-    if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    # Check if product has inventory
-    for inv in inventories.values():
-        if inv.product_id == product_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot delete product with existing inventory. Remove inventory first.",
-            )
-
-    del products[product_id]
+    """Delete a product record."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM products WHERE product_id=%s",
+                        (str(product_id),))
+            if cur.rowcount == 0:
+                raise HTTPException(
+                    status_code=404, detail="Product not found")
+            conn.commit()
     return None
 
 
