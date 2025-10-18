@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from typing import Dict, List, Optional
+import uuid
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Path
@@ -145,17 +146,13 @@ def create_product(product: ProductCreate):
     """Create a new product."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM products WHERE product_id=%s",
-                        (str(product.product_id),))
-            if cur.fetchone() is not None:
-                raise HTTPException(
-                    status_code=409, detail="Product already exists")
-
             # Check for duplicate SKU
             cur.execute("SELECT 1 FROM products WHERE sku=%s", (product.sku,))
             if cur.fetchone() is not None:
                 raise HTTPException(
                     status_code=409, detail=f"Product with SKU '{product.sku}' already exists")
+            
+            product_id = uuid.uuid4()
 
             cur.execute("""
                 INSERT INTO products (
@@ -164,7 +161,7 @@ def create_product(product: ProductCreate):
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
             """, (
-                str(product.product_id),
+                str(product_id),
                 product.sku,
                 product.name,
                 product.description,
@@ -179,7 +176,7 @@ def create_product(product: ProductCreate):
                 SELECT *
                 FROM products
                 WHERE product_id=%s
-            """, (str(product.product_id),))
+            """, (str(product_id),))
             row = cur.fetchone()
             return row_to_product_read(row)
 
