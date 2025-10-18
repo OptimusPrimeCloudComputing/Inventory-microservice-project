@@ -176,7 +176,9 @@ def create_product(product: ProductCreate):
             conn.commit()
 
             cur.execute("""
-                SELECT * FROM products WHERE product_id=%s
+                SELECT *
+                FROM products
+                WHERE product_id=%s
             """, (str(product.product_id),))
             row = cur.fetchone()
             return row_to_product_read(row)
@@ -199,7 +201,8 @@ def list_products(
 ):
     """List all products records with optional filters."""
     sql = """
-        SELECT * FROM products
+        SELECT *
+        FROM products
     """
     where = []
     params = []
@@ -241,7 +244,9 @@ def get_product(product_id: UUID = Path(..., description="Product ID")):
     """Get a specific product by ID."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT * FROM products WHERE product_id=%s
+            SELECT *
+            FROM products
+            WHERE product_id=%s
         """, (str(product_id),))
         row = cur.fetchone()
         if not row:
@@ -291,7 +296,9 @@ def update_product(
             conn.commit()
 
             cur.execute("""
-                SELECT * FROM products WHERE product_id=%s
+                SELECT *
+                FROM products
+                WHERE product_id=%s
             """, (str(product_id),))
             row = cur.fetchone()
             if not row:
