@@ -151,6 +151,12 @@ def create_product(product: ProductCreate):
                 raise HTTPException(
                     status_code=409, detail="Product already exists")
 
+            # Check for duplicate SKU
+            cur.execute("SELECT 1 FROM products WHERE sku=%s", (product.sku,))
+            if cur.fetchone() is not None:
+                raise HTTPException(
+                    status_code=409, detail=f"Product with SKU '{product.sku}' already exists")
+
             cur.execute("""
                 INSERT INTO products (
                     product_id, sku, name, description, price, category, brand,
@@ -238,7 +244,7 @@ def get_product(product_id: UUID = Path(..., description="Product ID")):
     """Get a specific product by ID."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT *,
+            SELECT *
             FROM products
             WHERE product_id=%s
         """, (str(product_id),))
@@ -246,7 +252,7 @@ def get_product(product_id: UUID = Path(..., description="Product ID")):
         if not row:
             raise HTTPException(
                 status_code=404, detail="Product not found")
-        return row
+        return row_to_product_read(row)
 
 
 @app.patch("/products/{product_id}", response_model=ProductRead)
@@ -255,17 +261,24 @@ def update_product(
         product_update: ProductUpdate = None,
 ):
     """Update a product record (partial update)."""
-    existing = products[product_id]
     update_data = product_update.model_dump(exclude_unset=True)
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
     
-    # Check if SKU is being changed and if new SKU already exists
-    if "sku" in update_data and update_data["sku"] != existing.sku:
-        for p in products.values():
-            if p.sku == update_data["sku"] and p.id != product_id:
-                raise HTTPException(
-                    status_code=400, detail=f"Product with SKU '{update_data['sku']}' already exists")
+    # Check if SKU is being changed and if new SKU already exist
+    if "sku" in update_data:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM products WHERE sku = %s AND product_id != %s",
+                    (update_data["sku"], str(product_id))
+                )
+                if cur.fetchone():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Product with SKU '{update_data['sku']}' already exists"
+                    )
+
 
     fields = []
     params = []
@@ -283,7 +296,7 @@ def update_product(
             conn.commit()
 
             cur.execute("""
-                SELECT *,
+                SELECT *
                 FROM products
                 WHERE product_id=%s
             """, (str(product_id),))
@@ -413,7 +426,7 @@ def get_inventory(inventory_id: UUID = Path(...)):
         if not row:
             raise HTTPException(
                 status_code=404, detail="Inventory record not found")
-        return row
+        return row_to_inventory_read(row)
 
 
 @app.get("/inventory/product/{product_id}", response_model=InventoryRead)
