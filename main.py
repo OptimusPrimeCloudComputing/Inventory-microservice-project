@@ -10,7 +10,8 @@ import uuid
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Response, status, Request, Query, Path
-from fastapi.responses import JSONResponse
+from fastapi_pagination import add_pagination, paginate, set_page, set_params
+from fastapi_pagination.limit_offset import LimitOffsetParams, LimitOffsetPage
 
 from models.product import ProductCreate, ProductRead, ProductUpdate, ProductResponse
 from models.inventory import (
@@ -20,6 +21,7 @@ from models.inventory import (
     InventoryAdjustment,
     InventoryResponse,
 )
+from models.gen_response import PaginateResponse
 from models.health import Health
 from db import get_connection
 import pymysql
@@ -106,6 +108,8 @@ app = FastAPI(
     description="FastAPI microservice for managing products and inventory for an online store",
     version="1.0.0",
 )
+
+add_pagination(app)
 
 
 # -----------------------------------------------------------------------------
@@ -206,8 +210,9 @@ def create_product(product: ProductCreate, response: Response, request: Request)
             return response_data
 
 
-@app.get("/products", response_model=List[ProductRead])
+@app.get("/products", response_model=PaginateResponse)
 def list_products(
+        request: Request,
         sku: Optional[str] = Query(None, description="Filter by SKU"),
         name: Optional[str] = Query(
             None, description="Filter by name (contains)"),
@@ -220,6 +225,8 @@ def list_products(
             None, description="Minimum price"),
         max_price: Optional[Decimal] = Query(
             None, description="Maximum price"),
+        limit: int = Query(10, ge=1, le=100),
+        offset: int = Query(0, ge=0)
 ):
     """List all products records with optional filters."""
     sql = """
@@ -253,12 +260,58 @@ def list_products(
 
     if where:
         sql += " WHERE " + " AND ".join(where)
+
     sql += " ORDER BY created_at DESC"
+    sql += " LIMIT %s OFFSET %s"
+
+    products = []
 
     with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
+        total_sql = "SELECT COUNT(*) FROM products"
+        if where:
+            total_sql += " WHERE " + " AND ".join(where)
+        cur.execute(total_sql, params)
+        total_row = cur.fetchone()
+        total = total_row["COUNT(*)"] if total_row else 0
+
+        cur.execute(sql, params + [limit, offset])
         rows = cur.fetchall()
-        return [row_to_product_read(r) for r in rows]
+        products = [row_to_product_read(r) for r in rows]
+
+    params = {key:val for key, val in {
+        "sku": sku,
+        "name": name,
+        "category": category,
+        "brand": brand,
+        "is_active": is_active,
+        "min_price": min_price,
+        "max_price": max_price
+    }.items() if val is not None} # removing non-explicit None params
+
+    def url(offset_val: int = offset):
+        request_params = "&".join([f"{key}={val}" for key, val in params.items()])
+        return f"{str(request.url_for("list_products"))}?{request_params}&limit={limit}&offset={offset_val}"
+
+    links = [
+        {
+            "rel": "current",
+            "href": url(offset)
+        }
+    ]
+
+    if offset > 0:
+        links.append({
+            "rel": "prev",
+            "href": url(max(0, offset - limit))
+        })
+
+    if offset + limit < int(total):
+        links.append({
+            "rel": "next",
+            "href": url(offset + limit)
+        })
+
+    return PaginateResponse(data=products,links=links)
 
 
 @app.get("/products/{product_id}", response_model=ProductRead)
@@ -421,12 +474,15 @@ def create_inventory(inventory: InventoryCreate, response: Response, request: Re
             return response_data
 
 
-@app.get("/inventory", response_model=List[InventoryRead])
+@app.get("/inventory", response_model=PaginateResponse)
 def list_inventory(
+    request: Request,
     product_id: Optional[UUID] = Query(None),
     warehouse_location: Optional[str] = Query(None),
     needs_reorder: Optional[bool] = Query(None),
     low_stock: Optional[bool] = Query(None),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0)
 ):
     """List all inventory records with optional filters."""
     sql = """
@@ -454,11 +510,53 @@ def list_inventory(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at DESC"
+    sql += " LIMIT %s OFFSET %s"
+
+    inventory = []
 
     with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
+        total_sql = "SELECT COUNT(*) FROM inventory"
+        if where:
+            total_sql += " WHERE " + " AND ".join(where)
+        cur.execute(total_sql, params)
+        total_row = cur.fetchone()
+        total = total_row["COUNT(*)"] if total_row else 0
+
+        cur.execute(sql, params + [limit, offset])
         rows = cur.fetchall()
-        return [row_to_inventory_read(r) for r in rows]
+        inventory = [row_to_inventory_read(r) for r in rows]
+
+    params = {key:val for key, val in {
+        "product_id": product_id,
+        "warehouse_location": warehouse_location,
+        "needs_reorder": needs_reorder,
+        "low_stock": low_stock
+    }.items() if val is not None} # removing non-explicit None params
+
+    def url(offset_val: int = offset):
+        request_params = "&".join([f"{key}={val}" for key, val in params.items()])
+        return f"{str(request.url_for("list_inventory"))}?{request_params}&limit={limit}&offset={offset_val}"
+
+    links = [
+        {
+            "rel": "current",
+            "href": url(offset)
+        }
+    ]
+
+    if offset > 0:
+        links.append({
+            "rel": "prev",
+            "href": url(max(0, offset - limit))
+        })
+
+    if offset + limit < int(total):
+        links.append({
+            "rel": "next",
+            "href": url(offset + limit)
+        })
+
+    return PaginateResponse(data=inventory,links=links)
 
 
 @app.get("/inventory/{inventory_id}", response_model=InventoryRead)
