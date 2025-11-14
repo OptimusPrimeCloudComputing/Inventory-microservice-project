@@ -213,3 +213,26 @@ class InventoryResponse(BaseModel):
     # allows for a message to be included when an inventory is created
     message: str = "New product created"
     product: InventoryRead
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "message": "New product created",
+                    "product": {
+                        "id": "33333333-3333-4333-8333-333333333333",
+                        "product_id": "11111111-1111-4111-8111-111111111111",
+                        "quantity": 150,
+                        "warehouse_location": "A-12-05",
+                        "reorder_level": 20,
+                        "reorder_quantity": 100,
+                        "reserved_quantity": 10,
+                        "available_quantity": 140,
+                        "needs_reorder": False,
+                        "last_restocked_at": "2025-09-28T14:30:00Z",
+                        "created_at": "2025-09-30T10:20:30Z",
+                        "updated_at": "2025-09-30T12:00:00Z",
+                    },
+                }
+            ]
+        }
+    }

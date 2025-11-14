@@ -182,3 +182,24 @@ class ProductResponse(BaseModel):
     # allows for a message to be included when a product is created
     message: str = "New product created"
     product: ProductRead
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "message": "New product created",
+                    "product": {
+                        "id": "11111111-1111-4111-8111-111111111111",
+                        "sku": "PROD-12345",
+                        "name": "Wireless Mouse",
+                        "description": "Ergonomic wireless mouse with USB receiver",
+                        "price": "29.99",
+                        "category": "Electronics",
+                        "brand": "TechCorp",
+                        "is_active": True,
+                        "created_at": "2025-09-30T10:20:30Z",
+                        "updated_at": "2025-09-30T12:00:00Z",
+                    },
+                }
+            ]
+        }
+    }
