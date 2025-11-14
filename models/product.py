@@ -177,3 +177,8 @@ class ProductRead(ProductBase):
             ]
         }
     }
+
+class ProductResponse(BaseModel):
+    # allows for a message to be included when a product is created
+    message: str = "New product created"
+    product: ProductRead

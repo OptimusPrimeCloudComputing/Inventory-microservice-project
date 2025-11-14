@@ -208,3 +208,8 @@ class InventoryAdjustment(BaseModel):
             ]
         }
     }
+
+class InventoryResponse(BaseModel):
+    # allows for a message to be included when an inventory is created
+    message: str = "New product created"
+    product: InventoryRead

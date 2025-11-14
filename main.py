@@ -9,14 +9,16 @@ from typing import Dict, List, Optional
 import uuid
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Response, status, Request, Query, Path
+from fastapi.responses import JSONResponse
 
-from models.product import ProductCreate, ProductRead, ProductUpdate
+from models.product import ProductCreate, ProductRead, ProductUpdate, ProductResponse
 from models.inventory import (
     InventoryCreate,
     InventoryRead,
     InventoryUpdate,
     InventoryAdjustment,
+    InventoryResponse,
 )
 from models.health import Health
 from db import get_connection
@@ -141,8 +143,8 @@ def get_health_with_path(
 # -----------------------------------------------------------------------------
 
 
-@app.post("/products", response_model=ProductRead, status_code=201)
-def create_product(product: ProductCreate):
+@app.post("/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+def create_product(product: ProductCreate, response: Response, request: Request):
     """Create a new product."""
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -150,7 +152,7 @@ def create_product(product: ProductCreate):
             cur.execute("SELECT 1 FROM products WHERE sku=%s", (product.sku,))
             if cur.fetchone() is not None:
                 raise HTTPException(
-                    status_code=409, detail=f"Product with SKU '{product.sku}' already exists")
+                    status_code=status.HTTP_409_CONFLICT, detail=f"Product with SKU '{product.sku}' already exists")
             
             product_id = uuid.uuid4()
 
@@ -178,7 +180,30 @@ def create_product(product: ProductCreate):
                 WHERE product_id=%s
             """, (str(product_id),))
             row = cur.fetchone()
-            return row_to_product_read(row)
+
+            if not row:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve created product")
+            
+            response_data = {
+                "message": "New product created",
+                "product": {
+                    "product_id": row["product_id"],
+                    "sku": row["sku"],
+                    "name": row["name"],
+                    "description": row["description"],
+                    "price": row["price"],
+                    "category": row["category"] if row["category"] is not None else None,
+                    "brand": row["brand"] if row["brand"] is not None else None,
+                    "is_active": bool(row["is_active"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"]
+                }
+            }
+            
+            response.headers["Location"] = str(request.url_for("get_product", product_id=product_id))
+
+            return response_data
 
 
 @app.get("/products", response_model=List[ProductRead])
@@ -323,8 +348,8 @@ def delete_product(product_id: UUID = Path(..., description="Product ID")):
 # -----------------------------------------------------------------------------
 
 
-@app.post("/inventory", response_model=InventoryRead, status_code=201)
-def create_inventory(inventory: InventoryCreate):
+@app.post("/inventory", response_model=InventoryResponse, status_code=status.HTTP_201_CREATED)
+def create_inventory(inventory: InventoryCreate, response: Response, request: Request):
     """Create a new inventory record for a product."""
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -339,6 +364,8 @@ def create_inventory(inventory: InventoryCreate):
             if cur.fetchone():
                 raise HTTPException(
                     status_code=400, detail="Inventory record already exists for this product")
+            
+            inventory_id = uuid.uuid4()
 
             cur.execute("""
                 INSERT INTO inventory (
@@ -346,8 +373,9 @@ def create_inventory(inventory: InventoryCreate):
                     reorder_level, reorder_quantity, reserved_quantity,
                     last_restocked_at, created_at, updated_at
                 )
-                VALUES (UUID(), %s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
             """, (
+                str(inventory_id),
                 str(inventory.product_id),
                 inventory.quantity,
                 inventory.warehouse_location,
@@ -365,7 +393,32 @@ def create_inventory(inventory: InventoryCreate):
                 WHERE product_id=%s
             """, (str(inventory.product_id),))
             row = cur.fetchone()
-            return row_to_inventory_read(row)
+
+            if not row:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve created inventory")
+            
+            response_data = {
+                "message": "New inventory created",
+                "product": {
+                    "inventory_id": row["inventory_id"],
+                    "product_id": row["product_id"],
+                    "quantity": row["quantity"],
+                    "warehouse_location": row["warehouse_location"] if row["warehouse_location"] is not None else None,
+                    "reorder_level": row["reorder_level"] if row["reorder_level"] is not None else None,
+                    "reorder_quantity": row["reorder_quantity"] if row["reorder_quantity"] is not None else None,
+                    "reserved_quantity": row["reserved_quantity"],
+                    "available_quantity": row["available_quantity"],
+                    "needs_reorder": bool(row["needs_reorder"]),
+                    "last_restocked_at": row["last_restocked_at"] if row["last_restocked_at"] is not None else None,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"]
+                }
+            }
+            
+            response.headers["Location"] = str(request.url_for("get_inventory", inventory_id=inventory_id))
+
+            return response_data
 
 
 @app.get("/inventory", response_model=List[InventoryRead])
@@ -480,7 +533,7 @@ def update_inventory(inventory_id: UUID, inventory_update: InventoryUpdate):
             return row_to_inventory_read(row)
 
 
-@app.post("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
+@app.patch("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
 def adjust_inventory(inventory_id: UUID, adjustment: InventoryAdjustment):
     """Adjust inventory quantity (add or remove stock)."""
     with get_connection() as conn:
