@@ -8,6 +8,10 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 import uuid
 from uuid import UUID
+import hashlib
+import json
+from email.utils import parsedate_to_datetime
+from datetime import timezone
 
 from fastapi import FastAPI, HTTPException, Response, status, Request, Query, Path
 from fastapi_pagination import add_pagination
@@ -190,6 +194,67 @@ def row_to_inventory_read(row: dict, links: List = []) -> InventoryRead:
     )
 
 
+def create_etag(row: dict):
+    """
+    Generates an ETag based on all row data
+    """
+    if not row:
+        return None
+
+    items = []
+    for k in sorted(row.keys()):
+        v = row[k]
+
+        if isinstance(v, datetime):
+            v = v.isoformat()
+
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8")
+
+        v = str(v)
+
+        items.append((k, None if v is None else str(v)))
+
+    canonical = json.dumps(items, separators=(",",":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f'"{digest}"'
+
+
+def _parse_http_date(value: str):
+    """Parse an HTTP-date string to a timezone-aware UTC datetime. Returns None on parse error."""
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            # assume UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _etag_matches(header_value: str, etag: str) -> bool:
+    """Return True if any ETag in header_value matches etag. Support '*' wildcard."""
+    if not header_value:
+        return False
+    header_value = header_value.strip()
+    if header_value == '*':
+        return True
+    parts = [p.strip() for p in header_value.split(',') if p.strip()]
+    return any(p == etag for p in parts)
+
+
+def _set_last_modified_header(response: Response, updated_at):
+    try:
+        if hasattr(updated_at, 'strftime'):
+            # Format as RFC1123 (HTTP-date) in GMT
+            lm = updated_at.strftime("%a, %d %b %Y %H:%M:%S GMT")
+            response.headers['Last-Modified'] = lm
+    except Exception:
+        pass
+
+
 port = int(os.environ.get("FASTAPIPORT", 8000))
 
 # -----------------------------------------------------------------------------
@@ -285,6 +350,10 @@ def create_product(product: ProductCreate, response: Response, request: Request)
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve created product")
             
             links = set_product_links(product_id=product_id, request=request, cur=cur)
+
+            etag = create_etag(row)
+            if etag:
+                response.headers["ETag"] = etag
             
             response_data = {
                 "message": "New product created",
@@ -420,7 +489,7 @@ def list_products(
 
 
 @app.get("/products/{product_id}", response_model=ProductRead)
-def get_product(request: Request, product_id: UUID = Path(..., description="Product ID")):
+def get_product(request: Request, response: Response, product_id: UUID = Path(..., description="Product ID")):
     """Get a specific product by ID."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -434,14 +503,37 @@ def get_product(request: Request, product_id: UUID = Path(..., description="Prod
                 status_code=404, detail="Product not found")
         
         links = set_product_links(product_id=product_id, request=request, cur=cur)
+
+        etag = create_etag(row)
+
+        inm = request.headers.get("if-none-match")
+        if inm and etag and _etag_matches(inm, etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED)
+
+        ims = request.headers.get("if-modified-since")
+        if ims and row.get("updated_at") is not None:
+            parsed = _parse_http_date(ims)
+            if parsed is not None:
+                updated_at = row.get("updated_at")
+                if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                    updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                if updated_at <= parsed:
+                    return Response(status_code=status.HTTP_304_NOT_MODIFIED)
+
+        if etag:
+            response.headers["ETag"] = etag
+
+        _set_last_modified_header(response, row.get("updated_at"))
+
         return row_to_product_read(row=row, links=links)
 
 
 @app.put("/products/{product_id}", response_model=ProductRead)
 def replace_product(
-        request: Request,
-        product_id: UUID = Path(..., description="Product ID"),
-        product_replace: ProductReplace = None,
+    request: Request,
+    response: Response,
+    product_id: UUID = Path(..., description="Product ID"),
+    product_replace: ProductReplace = None,
 ):
     """Replace a product entirely (all fields required). The product ID will remain the same."""
     if product_replace is None:
@@ -485,7 +577,31 @@ def replace_product(
             # Check if product exists
             cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(product_id),))
             if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Product not found")
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+            
+            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+            cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
+            current_row = cur.fetchone()
+            if not current_row:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+            
+            current_etag = create_etag(current_row)
+
+            if_match = request.headers.get("if-match")
+            if if_match:
+                if not _etag_matches(if_match, current_etag):
+                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+            else:
+                # check If-Unmodified-Since
+                ius = request.headers.get("if-unmodified-since")
+                if ius and current_row.get("updated_at") is not None:
+                    parsed = _parse_http_date(ius)
+                    if parsed is not None:
+                        updated_at = current_row.get("updated_at")
+                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        if updated_at > parsed:
+                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
             
             sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
             cur.execute(sql, params)
@@ -502,14 +618,22 @@ def replace_product(
                     status_code=404, detail="Product not found")    
 
             links = set_product_links(product_id=product_id, request=request, cur=cur)
+
+            etag = create_etag(row)
+
+            if etag:
+                response.headers["ETag"] = etag
+            _set_last_modified_header(response, row.get("updated_at"))
+
             return row_to_product_read(row=row, links=links)
         
 
 @app.patch("/products/{product_id}", response_model=ProductRead)
 def update_product(
-        request: Request,
-        product_id: UUID = Path(..., description="Product ID"),
-        product_update: ProductUpdate = None,
+    request: Request,
+    response: Response,
+    product_id: UUID = Path(..., description="Product ID"),
+    product_update: ProductUpdate = None,
 ):
     """Update a product record (partial update)."""
     update_data = product_update.model_dump(exclude_unset=True)
@@ -541,6 +665,29 @@ def update_product(
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+            cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
+            current_row = cur.fetchone()
+            if not current_row:
+                raise HTTPException(status_code=404, detail="Product not found")
+            
+            current_etag = create_etag(current_row)
+
+            if_match = request.headers.get("if-match")
+            if if_match:
+                if not _etag_matches(if_match, current_etag):
+                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+            else:
+                ius = request.headers.get("if-unmodified-since")
+                if ius and current_row.get("updated_at") is not None:
+                    parsed = _parse_http_date(ius)
+                    if parsed is not None:
+                        updated_at = current_row.get("updated_at")
+                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        if updated_at > parsed:
+                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
             sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
             print(sql)
             cur.execute(sql, params)
@@ -557,14 +704,44 @@ def update_product(
                     status_code=404, detail="Product not found")    
 
             links = set_product_links(product_id=product_id, request=request, cur=cur)
+
+            etag = create_etag(row)
+
+            if etag:
+                response.headers["ETag"] = etag
+            _set_last_modified_header(response, row.get("updated_at"))
+
             return row_to_product_read(row=row, links=links)
 
 
 @app.delete("/products/{product_id}", status_code=204)
-def delete_product(product_id: UUID = Path(..., description="Product ID")):
+def delete_product(request: Request, response: Response, product_id: UUID = Path(..., description="Product ID")):
     """Delete a product record."""
     with get_connection() as conn:
         with conn.cursor() as cur:
+            # Check current ETag before deleting
+            cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
+            current_row = cur.fetchone()
+            if not current_row:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+            
+            current_etag = create_etag(current_row)
+
+            if_match = request.headers.get("if-match")
+            if if_match:
+                if not _etag_matches(if_match, current_etag):
+                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+            else:
+                ius = request.headers.get("if-unmodified-since")
+                if ius and current_row.get("updated_at") is not None:
+                    parsed = _parse_http_date(ius)
+                    if parsed is not None:
+                        updated_at = current_row.get("updated_at")
+                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        if updated_at > parsed:
+                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
             cur.execute("DELETE FROM products WHERE product_id=%s",
                         (str(product_id),))
             if cur.rowcount == 0:
@@ -631,6 +808,10 @@ def create_inventory(inventory: InventoryCreate, response: Response, request: Re
             
             links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
             
+            etag = create_etag(row)
+            if etag:
+                response.headers["ETag"] = etag
+                
             response_data = {
                 "message": "New inventory created",
                 "product": {
@@ -748,7 +929,7 @@ def list_inventory(
 
 
 @app.get("/inventory/{inventory_id}", response_model=InventoryRead)
-def get_inventory(request: Request, inventory_id: UUID = Path(...)):
+def get_inventory(request: Request, response: Response, inventory_id: UUID = Path(...)):
     """Get a specific inventory record by ID."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -761,14 +942,36 @@ def get_inventory(request: Request, inventory_id: UUID = Path(...)):
         row = cur.fetchone()
         if not row:
             raise HTTPException(
-                status_code=404, detail="Inventory record not found")
+                status_code=status.HTTP_404_NOT_FOUND, detail="Inventory record not found")
         
         links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+
+        etag = create_etag(row)
+
+        inm = request.headers.get("if-none-match")
+        if inm and etag and _etag_matches(inm, etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED)
+        
+        ims = request.headers.get("if-modified-since")
+        if ims and row.get("updated_at") is not None:
+            parsed = _parse_http_date(ims)
+            if parsed is not None:
+                updated_at = row.get("updated_at")
+                if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                    updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                if updated_at <= parsed:
+                    return Response(status_code=status.HTTP_304_NOT_MODIFIED)
+                
+        if etag:
+            response.headers["ETag"] = etag
+
+        _set_last_modified_header(response, row.get("updated_at"))
+
         return row_to_inventory_read(row=row, links=links)
 
 
 @app.get("/inventory/product/{product_id}", response_model=InventoryRead)
-def get_inventory_by_product(request: Request, product_id: UUID = Path(...)):
+def get_inventory_by_product(request: Request, response: Response, product_id: UUID = Path(...)):
     """Get inventory record for a specific product."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -784,14 +987,24 @@ def get_inventory_by_product(request: Request, product_id: UUID = Path(...)):
                 status_code=404, detail="Inventory record not found for this product")
         
         links = set_inventory_links(inventory_id=UUID(str(row["inventory_id"])), request=request, cur=cur, query_by_product=True)
+        
+        etag = create_etag(row)
+
+        if etag:
+            inm = request.headers.get("if-none-match")
+            if inm and inm == etag:
+                return Response(status_code=status.HTTP_304_NOT_MODIFIED)
+            response.headers["ETag"] = etag
+
         return row_to_inventory_read(row=row, links=links)
 
 
 @app.put("/inventory/{inventory_id}", response_model=InventoryRead)
 def replace_inventory(
-        request: Request, 
-        inventory_id: UUID, 
-        inventory_replace: InventoryReplace
+    request: Request,
+    response: Response,
+    inventory_id: UUID,
+    inventory_replace: InventoryReplace
 ):
     """Replace an inventory record entirely (all fields required). The inventory ID will remain the same."""
     if inventory_replace is None:
@@ -828,11 +1041,29 @@ def replace_inventory(
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # Check if inventory record exists
-            cur.execute("SELECT 1 FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
-            if not cur.fetchone():
+            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+            existing = cur.fetchone()
+            if not existing:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory record not found")
             
+            current_etag = create_etag(existing)
+            
+            if_match = request.headers.get("if-match")
+            if if_match:
+                if not _etag_matches(if_match, current_etag):
+                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+            else:
+                ius = request.headers.get("if-unmodified-since")
+                if ius and existing.get("updated_at") is not None:
+                    parsed = _parse_http_date(ius)
+                    if parsed is not None:
+                        updated_at = existing.get("updated_at")
+                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        if updated_at > parsed:
+                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
             sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
             cur.execute(sql, params)
             conn.commit()
@@ -850,11 +1081,18 @@ def replace_inventory(
                     status_code=404, detail="Inventory record not found")
             
             links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+
+            etag = create_etag(row)
+            if etag:
+                response.headers["ETag"] = etag
+
+            _set_last_modified_header(response, row.get("updated_at"))
+
             return row_to_inventory_read(row=row, links=links)
 
 
 @app.patch("/inventory/{inventory_id}", response_model=InventoryRead)
-def update_inventory(request: Request, inventory_id: UUID, inventory_update: InventoryUpdate):
+def update_inventory(request: Request, response: Response, inventory_id: UUID, inventory_update: InventoryUpdate):
     """Update an inventory record (partial update)."""
     update_data = inventory_update.model_dump(exclude_unset=True)
     if not update_data:
@@ -870,6 +1108,29 @@ def update_inventory(request: Request, inventory_id: UUID, inventory_update: Inv
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+            existing = cur.fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Inventory record not found")
+            
+            current_etag = create_etag(existing)
+
+            if_match = request.headers.get("if-match")
+            if if_match:
+                if not _etag_matches(if_match, current_etag):
+                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+            else:
+                ius = request.headers.get("if-unmodified-since")
+                if ius and existing.get("updated_at") is not None:
+                    parsed = _parse_http_date(ius)
+                    if parsed is not None:
+                        updated_at = existing.get("updated_at")
+                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        if updated_at > parsed:
+                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
             sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
             print(sql)
             cur.execute(sql, params)
@@ -888,14 +1149,32 @@ def update_inventory(request: Request, inventory_id: UUID, inventory_update: Inv
                     status_code=404, detail="Inventory record not found")
             
             links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+
+            etag = create_etag(row)
+
+            if etag:
+                response.headers["ETag"] = etag
+
+            _set_last_modified_header(response, row.get("updated_at"))
+
             return row_to_inventory_read(row=row, links=links)
 
 
 @app.patch("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
-def adjust_inventory(request: Request, inventory_id: UUID, adjustment: InventoryAdjustment):
+def adjust_inventory(request: Request, response: Response, inventory_id: UUID, adjustment: InventoryAdjustment):
     """Adjust inventory quantity (add or remove stock)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
+            # Check If-Match for concurrency
+            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+            existing = cur.fetchone()
+
+            current_etag = create_etag(existing) if existing else None
+
+            if_match = request.headers.get("if-match")
+            if if_match and current_etag and if_match != current_etag:
+                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+
             cur.execute(
                 "SELECT quantity, reserved_quantity, reorder_level FROM inventory WHERE inventory_id=%s FOR UPDATE", (str(inventory_id),))
             row = cur.fetchone()
@@ -927,14 +1206,42 @@ def adjust_inventory(request: Request, inventory_id: UUID, adjustment: Inventory
             row = cur.fetchone()
 
             links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+
+            etag = create_etag(row)
+
+            if etag:
+                response.headers["ETag"] = etag
+
             return row_to_inventory_read(row=row, links=links)
 
 
 @app.delete("/inventory/{inventory_id}", status_code=204)
-def delete_inventory(inventory_id: UUID):
+def delete_inventory(request: Request, inventory_id: UUID, response: Response):
     """Delete an inventory record."""
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+            current_row = cur.fetchone()
+            if not current_row:
+                raise HTTPException(status_code=404, detail="Inventory record not found")
+            
+            current_etag = create_etag(current_row)
+
+            if_match = request.headers.get("if-match")
+            if if_match:
+                if not _etag_matches(if_match, current_etag):
+                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+            else:
+                ius = request.headers.get("if-unmodified-since")
+                if ius and current_row.get("updated_at") is not None:
+                    parsed = _parse_http_date(ius)
+                    if parsed is not None:
+                        updated_at = current_row.get("updated_at")
+                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        if updated_at > parsed:
+                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
             cur.execute("DELETE FROM inventory WHERE inventory_id=%s",
                         (str(inventory_id),))
             if cur.rowcount == 0:
