@@ -67,6 +67,7 @@ Once the server is running, access the interactive API documentation:
 | POST | `/products` | Create a new product |
 | GET | `/products` | List all products (with filters) |
 | GET | `/products/{product_id}` | Get a specific product |
+| PUT | `/products/{product_id}` | Replace a specific product |
 | PATCH | `/products/{product_id}` | Update a product |
 | DELETE | `/products/{product_id}` | Delete a product |
 
@@ -87,6 +88,7 @@ Once the server is running, access the interactive API documentation:
 | GET | `/inventory` | List all inventory (with filters) |
 | GET | `/inventory/{inventory_id}` | Get specific inventory record |
 | GET | `/inventory/product/{product_id}` | Get inventory by product ID |
+| PUT | `/inventory/{inventory_id}` | Replace specific inventory record |
 | PATCH | `/inventory/{inventory_id}` | Update inventory record |
 | POST | `/inventory/{inventory_id}/adjust` | Adjust inventory quantity |
 | DELETE | `/inventory/{inventory_id}` | Delete inventory record |
