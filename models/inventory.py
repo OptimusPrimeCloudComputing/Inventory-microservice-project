@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID, uuid4
 from datetime import datetime
 from pydantic import BaseModel, Field
+from models.gen_response import Link
 
 
 class InventoryBase(BaseModel):
@@ -79,6 +80,60 @@ class InventoryCreate(InventoryBase):
                     "reorder_level": 100,
                     "reorder_quantity": 1000,
                     "reserved_quantity": 0,
+                }
+            ]
+        }
+    }
+
+
+class InventoryReplace(BaseModel):
+    """Full replacement for an Inventory record; all fields required."""
+    product_id: UUID = Field(
+        ...,
+        description="Reference to the Product ID.",
+        json_schema_extra={"example": "11111111-1111-4111-8111-111111111111"},
+    )
+    quantity: int = Field(
+        ...,
+        description="Current stock quantity (unlimited capacity for online store).",
+        ge=0,
+        json_schema_extra={"example": 150},
+    )
+    warehouse_location: Optional[str] = Field(
+        None,
+        description="Physical location in warehouse or fulfillment center (optional for drop-shipped items).",
+        max_length=100,
+        json_schema_extra={"example": "A-12-05"},
+    )
+    reorder_level: Optional[int] = Field(
+        None,
+        description="Minimum quantity before reordering is needed.",
+        ge=0,
+        json_schema_extra={"example": 20},
+    )
+    reorder_quantity: Optional[int] = Field(
+        None,
+        description="Quantity to reorder when stock falls below reorder level.",
+        ge=0,
+        json_schema_extra={"example": 100},
+    )
+    reserved_quantity: int = Field(
+        default=0,
+        description="Quantity reserved for pending orders or items in shopping carts (not available for sale).",
+        ge=0,
+        json_schema_extra={"example": 10},
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "product_id": "11111111-1111-4111-8111-111111111111",
+                    "quantity": 150,
+                    "warehouse_location": "A-12-05",
+                    "reorder_level": 20,
+                    "reorder_quantity": 100,
+                    "reserved_quantity": 10
                 }
             ]
         }
@@ -161,6 +216,22 @@ class InventoryRead(InventoryBase):
         description="Last update timestamp (UTC).",
         json_schema_extra={"example": "2025-09-30T12:00:00Z"},
     )
+    links: List[Link] = Field(
+        ...,
+        description="HATEOAS links for inventory",
+        json_schema_extra={
+            "examples": [
+                {
+                    "rel": "self",
+                    "href": "https://api.example.com/inventory/33333333-3333-4333-8333-333333333333"
+                },
+                {
+                    "rel": "product",
+                    "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"
+                }
+            ]
+        }
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -178,6 +249,16 @@ class InventoryRead(InventoryBase):
                     "last_restocked_at": "2025-09-28T14:30:00Z",
                     "created_at": "2025-09-30T10:20:30Z",
                     "updated_at": "2025-09-30T12:00:00Z",
+                    "links": [
+                        {
+                            "rel": "self",
+                            "href": "https://api.example.com/inventory/33333333-3333-4333-8333-333333333333"
+                        },
+                        {
+                            "rel": "product",
+                            "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"
+                        }
+                    ]
                 }
             ]
         }
@@ -231,6 +312,16 @@ class InventoryResponse(BaseModel):
                         "last_restocked_at": "2025-09-28T14:30:00Z",
                         "created_at": "2025-09-30T10:20:30Z",
                         "updated_at": "2025-09-30T12:00:00Z",
+                        "links": [
+                            {
+                                "rel": "self",
+                                "href": "https://api.example.com/inventory/33333333-3333-4333-8333-333333333333"
+                            },
+                            {
+                                "rel": "product",
+                                "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"
+                            }
+                        ]
                     },
                 }
             ]

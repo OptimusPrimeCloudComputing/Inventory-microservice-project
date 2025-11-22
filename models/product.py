@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Optional, Annotated
+from typing import Optional, Annotated, List
 from uuid import UUID, uuid4
 from datetime import datetime
 from decimal import Decimal
 from pydantic import BaseModel, Field, StringConstraints
+from models.gen_response import Link
 
 # SKU pattern: alphanumeric with hyphens (e.g., PROD-12345)
 # Updated to support up to 50 characters for e-commerce flexibility
@@ -91,6 +92,62 @@ class ProductCreate(ProductBase):
     }
 
 
+class ProductReplace(BaseModel):
+    """Full update for a Product; supply only fields to change."""
+    sku: SKUType = Field(
+        None,
+        description="Stock Keeping Unit.",
+        json_schema_extra={"example": "PROD-54321"},
+    )
+    name: str = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        json_schema_extra={"example": "Updated Product Name"},
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=1000,
+        json_schema_extra={"example": "Updated product description"},
+    )
+    price: Decimal = Field(
+        None,
+        ge=0,
+        decimal_places=2,
+        json_schema_extra={"example": "39.99"},
+    )
+    category: Optional[str] = Field(
+        None,
+        max_length=100,
+        json_schema_extra={"example": "Office Supplies"},
+    )
+    brand: Optional[str] = Field(
+        None,
+        max_length=100,
+        json_schema_extra={"example": "NewBrand"},
+    )
+    is_active: bool = Field(
+        None,
+        json_schema_extra={"example": False},
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "sku": "PROD-12345",
+                    "name": "Wireless Mouse",
+                    "description": "Ergonomic wireless mouse with USB receiver",
+                    "price": "29.99",
+                    "category": "Electronics",
+                    "brand": "TechCorp",
+                    "is_active": True
+                }
+            ]
+        }
+    }
+
+
 class ProductUpdate(BaseModel):
     """Partial update for a Product; supply only fields to change."""
     sku: Optional[SKUType] = Field(
@@ -158,6 +215,22 @@ class ProductRead(ProductBase):
         description="Last update timestamp (UTC).",
         json_schema_extra={"example": "2025-09-30T12:00:00Z"},
     )
+    links: List[Link] = Field(
+        ...,
+        description="HATEOAS links for product",
+        json_schema_extra={
+            "examples": [
+                {
+                    "rel": "self",
+                    "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"
+                },
+                {
+                    "rel": "inventory-check",
+                    "href": "https://api.example.com/inventory/products/11111111-1111-4111-8111-111111111111"
+                }
+            ]
+        }
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -173,10 +246,21 @@ class ProductRead(ProductBase):
                     "is_active": True,
                     "created_at": "2025-09-30T10:20:30Z",
                     "updated_at": "2025-09-30T12:00:00Z",
+                    "links": [
+                        {
+                            "rel": "self",
+                            "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"
+                        },
+                        {
+                            "rel": "inventory-check",
+                            "href": "https://api.example.com/inventory/products/11111111-1111-4111-8111-111111111111"
+                        }
+                    ]
                 }
             ]
         }
     }
+
 
 class ProductResponse(BaseModel):
     # allows for a message to be included when a product is created
@@ -198,6 +282,16 @@ class ProductResponse(BaseModel):
                         "is_active": True,
                         "created_at": "2025-09-30T10:20:30Z",
                         "updated_at": "2025-09-30T12:00:00Z",
+                        "links": [
+                            {
+                                "rel": "self",
+                                "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"
+                            },
+                            {
+                                "rel": "inventory-check",
+                                "href": "https://api.example.com/inventory/products/11111111-1111-4111-8111-111111111111"
+                            }
+                        ]
                     },
                 }
             ]

@@ -10,13 +10,13 @@ import uuid
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Response, status, Request, Query, Path
-from fastapi_pagination import add_pagination, paginate, set_page, set_params
-from fastapi_pagination.limit_offset import LimitOffsetParams, LimitOffsetPage
+from fastapi_pagination import add_pagination
 
-from models.product import ProductCreate, ProductRead, ProductUpdate, ProductResponse
+from models.product import ProductCreate, ProductRead, ProductReplace, ProductUpdate, ProductResponse
 from models.inventory import (
     InventoryCreate,
     InventoryRead,
+    InventoryReplace,
     InventoryUpdate,
     InventoryAdjustment,
     InventoryResponse,
@@ -34,9 +34,123 @@ def _to_int(v):
         return int(v)
     except Exception:
         return v
+    
+def get_product_links(
+        product_id: UUID, 
+        request: Request, 
+        inventory_id: Optional[UUID] = None
+):
+    links = [
+        {
+            "rel": "self",
+            "href": str(request.url_for("get_product", product_id=product_id).path)
+        }
+    ]
 
+    if inventory_id:
+        links.append({
+            "rel": "inventory-check",
+            "href": str(request.url_for("get_inventory", inventory_id=inventory_id).path)
+        })
+    else:
+        links.append({
+            "rel": "inventory-check",
+            "href": str(request.url_for("create_inventory").path)
+        })
 
-def row_to_inventory_read(row: dict) -> InventoryRead:
+    return links
+
+def get_inventory_links(
+        inventory_id: UUID,
+        request: Request,
+        product_id: UUID,
+        query_by_product: bool = False
+):
+    links = []
+
+    if query_by_product:
+        links.append(
+            {
+                "rel": "self",
+                "href": str(request.url_for("get_inventory_by_product", product_id=product_id).path)
+            }
+        )
+    else:
+        links.append(
+            {
+                "rel": "self",
+                "href": str(request.url_for("get_inventory", inventory_id=inventory_id).path)
+            }
+        )
+    
+    links.append(
+        {
+            "rel": "product",
+            "href": str(request.url_for("get_product", product_id=product_id).path)
+        }
+    )
+
+    return links
+
+def set_product_links(
+        product_id: UUID,
+        request: Request,
+        cur: pymysql.cursors.Cursor
+):
+    cur.execute("""
+        SELECT inventory_id
+        FROM inventory
+        WHERE product_id=%s
+    """, (str(product_id),))
+    inv_row = cur.fetchone()
+
+    links = get_product_links(product_id=product_id, request=request)
+
+    if inv_row:
+        links = get_product_links(product_id=product_id, request=request, inventory_id=UUID(str(inv_row["inventory_id"])))
+
+    return links
+
+def set_inventory_links(
+        inventory_id: UUID,
+        request: Request,
+        cur: pymysql.cursors.Cursor,
+        query_by_product: bool = False
+):
+    cur.execute("""
+        SELECT product_id
+        FROM inventory
+        WHERE inventory_id=%s
+    """, (str(inventory_id),))
+    prod_row = cur.fetchone()
+
+    links = get_inventory_links(inventory_id=inventory_id, request=request, product_id=UUID(str(prod_row["product_id"])), query_by_product=query_by_product)
+
+    return links
+    
+    
+def row_to_product_read(row: dict, links: List = []) -> ProductRead:
+    """
+    Convert a SQL row from the `products` table (DictCursor) into ProductRead.
+    """
+    if not row:
+        return None
+
+    return ProductRead(
+        id=UUID(str(row["product_id"])),
+        sku=row.get("sku"),
+        name=row.get("name"),
+        description=row.get("description"),
+        price=Decimal(row.get("price")) if row.get("price") is not None else None,
+        category=row.get("category"),
+        brand=row.get("brand"),
+        is_active=bool(row.get("is_active")),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+        links=links
+    )
+
+def row_to_inventory_read(row: dict, links: List = []) -> InventoryRead:
     """
     Convert a SQL row from the `inventory` table (DictCursor) into InventoryRead.
     Assumes SELECT included computed columns:
@@ -72,26 +186,7 @@ def row_to_inventory_read(row: dict) -> InventoryRead:
         last_restocked_at=row.get("last_restocked_at"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
-    )
-
-def row_to_product_read(row: dict) -> ProductRead:
-    """
-    Convert a SQL row from the `products` table (DictCursor) into ProductRead.
-    """
-    if not row:
-        return None
-
-    return ProductRead(
-        id=UUID(str(row["product_id"])),
-        sku=row.get("sku"),
-        name=row.get("name"),
-        description=row.get("description"),
-        price=Decimal(row.get("price")) if row.get("price") is not None else None,
-        category=row.get("category"),
-        brand=row.get("brand"),
-        is_active=bool(row.get("is_active")),
-        created_at=row.get("created_at"),
-        updated_at=row.get("updated_at"),
+        links=links
     )
 
 
@@ -189,10 +284,12 @@ def create_product(product: ProductCreate, response: Response, request: Request)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve created product")
             
+            links = set_product_links(product_id=product_id, request=request, cur=cur)
+            
             response_data = {
                 "message": "New product created",
                 "product": {
-                    "product_id": row["product_id"],
+                    "product_id": str(product_id),
                     "sku": row["sku"],
                     "name": row["name"],
                     "description": row["description"],
@@ -201,7 +298,8 @@ def create_product(product: ProductCreate, response: Response, request: Request)
                     "brand": row["brand"] if row["brand"] is not None else None,
                     "is_active": bool(row["is_active"]),
                     "created_at": row["created_at"],
-                    "updated_at": row["updated_at"]
+                    "updated_at": row["updated_at"],
+                    "links": links
                 }
             }
             
@@ -276,7 +374,12 @@ def list_products(
 
         cur.execute(sql, params + [limit, offset])
         rows = cur.fetchall()
-        products = [row_to_product_read(r) for r in rows]
+
+        products = []
+
+        for row in rows:
+            links = set_product_links(product_id=UUID(str(row["product_id"])), request=request, cur=cur)
+            products.append(row_to_product_read(row=row, links=links))
 
     params = {key:val for key, val in {
         "sku": sku,
@@ -290,7 +393,9 @@ def list_products(
 
     def url(offset_val: int = offset):
         request_params = "&".join([f"{key}={val}" for key, val in params.items()])
-        return f"{str(request.url_for("list_products"))}?{request_params}&limit={limit}&offset={offset_val}"
+        if request_params:
+            request_params += "&"
+        return f"{str(request.url_for("list_products").path)}?{request_params}limit={limit}&offset={offset_val}"
 
     links = [
         {
@@ -315,7 +420,7 @@ def list_products(
 
 
 @app.get("/products/{product_id}", response_model=ProductRead)
-def get_product(product_id: UUID = Path(..., description="Product ID")):
+def get_product(request: Request, product_id: UUID = Path(..., description="Product ID")):
     """Get a specific product by ID."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -327,11 +432,82 @@ def get_product(product_id: UUID = Path(..., description="Product ID")):
         if not row:
             raise HTTPException(
                 status_code=404, detail="Product not found")
-        return row_to_product_read(row)
+        
+        links = set_product_links(product_id=product_id, request=request, cur=cur)
+        return row_to_product_read(row=row, links=links)
 
+
+@app.put("/products/{product_id}", response_model=ProductRead)
+def replace_product(
+        request: Request,
+        product_id: UUID = Path(..., description="Product ID"),
+        product_replace: ProductReplace = None,
+):
+    """Replace a product entirely (all fields required). The product ID will remain the same."""
+    if product_replace is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body is required")
+    
+    replace_data = product_replace.model_dump()
+    
+    # Validate that all required fields are present
+    required_fields = {"sku", "name", "price", "is_active"}
+    missing_fields = required_fields - set(replace_data.keys())
+    if missing_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"Missing required fields for full replacement: {', '.join(missing_fields)}"
+        )
+    
+    # Check if SKU is being changed and if new SKU already exist
+    if "sku" in replace_data:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM products WHERE sku = %s AND product_id != %s",
+                    (replace_data["sku"], str(product_id))
+                )
+                if cur.fetchone():
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Product with SKU '{replace_data['sku']}' already exists"
+                    )
+
+    fields = []
+    params = []
+    for k, v in replace_data.items():
+        fields.append(f"{k}=%s")
+        params.append(v)
+
+    params.append(str(product_id))
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Check if product exists
+            cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(product_id),))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Product not found")
+            
+            sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
+            cur.execute(sql, params)
+            conn.commit()
+
+            cur.execute("""
+                SELECT *
+                FROM products
+                WHERE product_id=%s
+            """, (str(product_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail="Product not found")    
+
+            links = set_product_links(product_id=product_id, request=request, cur=cur)
+            return row_to_product_read(row=row, links=links)
+        
 
 @app.patch("/products/{product_id}", response_model=ProductRead)
 def update_product(
+        request: Request,
         product_id: UUID = Path(..., description="Product ID"),
         product_update: ProductUpdate = None,
 ):
@@ -350,7 +526,7 @@ def update_product(
                 )
                 if cur.fetchone():
                     raise HTTPException(
-                        status_code=400,
+                        status_code=status.HTTP_409_CONFLICT,
                         detail=f"Product with SKU '{update_data['sku']}' already exists"
                     )
 
@@ -378,8 +554,10 @@ def update_product(
             row = cur.fetchone()
             if not row:
                 raise HTTPException(
-                    status_code=404, detail="Product not found")
-            return row_to_product_read(row)
+                    status_code=404, detail="Product not found")    
+
+            links = set_product_links(product_id=product_id, request=request, cur=cur)
+            return row_to_product_read(row=row, links=links)
 
 
 @app.delete("/products/{product_id}", status_code=204)
@@ -451,10 +629,12 @@ def create_inventory(inventory: InventoryCreate, response: Response, request: Re
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve created inventory")
             
+            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+            
             response_data = {
                 "message": "New inventory created",
                 "product": {
-                    "inventory_id": row["inventory_id"],
+                    "inventory_id": str(inventory_id),
                     "product_id": row["product_id"],
                     "quantity": row["quantity"],
                     "warehouse_location": row["warehouse_location"] if row["warehouse_location"] is not None else None,
@@ -465,7 +645,8 @@ def create_inventory(inventory: InventoryCreate, response: Response, request: Re
                     "needs_reorder": bool(row["needs_reorder"]),
                     "last_restocked_at": row["last_restocked_at"] if row["last_restocked_at"] is not None else None,
                     "created_at": row["created_at"],
-                    "updated_at": row["updated_at"]
+                    "updated_at": row["updated_at"],
+                    "links": links
                 }
             }
             
@@ -524,7 +705,12 @@ def list_inventory(
 
         cur.execute(sql, params + [limit, offset])
         rows = cur.fetchall()
-        inventory = [row_to_inventory_read(r) for r in rows]
+
+        inventory = []
+
+        for row in rows:
+            links = set_inventory_links(inventory_id=UUID(str(row["inventory_id"])), request=request, cur=cur)
+            inventory.append(row_to_inventory_read(row=row, links=links))
 
     params = {key:val for key, val in {
         "product_id": product_id,
@@ -535,7 +721,9 @@ def list_inventory(
 
     def url(offset_val: int = offset):
         request_params = "&".join([f"{key}={val}" for key, val in params.items()])
-        return f"{str(request.url_for("list_inventory"))}?{request_params}&limit={limit}&offset={offset_val}"
+        if request_params:
+            request_params += "&"
+        return f"{str(request.url_for("list_inventory").path)}?{request_params}limit={limit}&offset={offset_val}"
 
     links = [
         {
@@ -560,7 +748,7 @@ def list_inventory(
 
 
 @app.get("/inventory/{inventory_id}", response_model=InventoryRead)
-def get_inventory(inventory_id: UUID = Path(...)):
+def get_inventory(request: Request, inventory_id: UUID = Path(...)):
     """Get a specific inventory record by ID."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -574,11 +762,13 @@ def get_inventory(inventory_id: UUID = Path(...)):
         if not row:
             raise HTTPException(
                 status_code=404, detail="Inventory record not found")
-        return row_to_inventory_read(row)
+        
+        links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+        return row_to_inventory_read(row=row, links=links)
 
 
 @app.get("/inventory/product/{product_id}", response_model=InventoryRead)
-def get_inventory_by_product(product_id: UUID = Path(...)):
+def get_inventory_by_product(request: Request, product_id: UUID = Path(...)):
     """Get inventory record for a specific product."""
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -592,11 +782,79 @@ def get_inventory_by_product(product_id: UUID = Path(...)):
         if not row:
             raise HTTPException(
                 status_code=404, detail="Inventory record not found for this product")
-        return row_to_inventory_read(row)
+        
+        links = set_inventory_links(inventory_id=UUID(str(row["inventory_id"])), request=request, cur=cur, query_by_product=True)
+        return row_to_inventory_read(row=row, links=links)
+
+
+@app.put("/inventory/{inventory_id}", response_model=InventoryRead)
+def replace_inventory(
+        request: Request, 
+        inventory_id: UUID, 
+        inventory_replace: InventoryReplace
+):
+    """Replace an inventory record entirely (all fields required). The inventory ID will remain the same."""
+    if inventory_replace is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body is required")
+    
+    replace_data = inventory_replace.model_dump(exclude_unset=False)
+    
+    # Validate that the product exists
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(replace_data["product_id"]),))
+            if not cur.fetchone():
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, 
+                    detail=f"Product with ID {replace_data['product_id']} not found"
+                )
+            
+    # Validate that all required fields are present
+    required_fields = {"product_id", "quantity", "reserved_quantity"}
+    missing_fields = required_fields - set(replace_data.keys())
+    if missing_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"Missing required fields for full replacement: {', '.join(missing_fields)}"
+        )
+
+    fields = []
+    params = []
+    for k, v in replace_data.items():
+        fields.append(f"{k}=%s")
+        params.append(v)
+
+    params.append(str(inventory_id))
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Check if inventory record exists
+            cur.execute("SELECT 1 FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+            if not cur.fetchone():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory record not found")
+            
+            sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
+            cur.execute(sql, params)
+            conn.commit()
+
+            cur.execute("""
+                SELECT *,
+                       (quantity - reserved_quantity) AS available_quantity,
+                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                FROM inventory
+                WHERE inventory_id=%s
+            """, (str(inventory_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail="Inventory record not found")
+            
+            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+            return row_to_inventory_read(row=row, links=links)
 
 
 @app.patch("/inventory/{inventory_id}", response_model=InventoryRead)
-def update_inventory(inventory_id: UUID, inventory_update: InventoryUpdate):
+def update_inventory(request: Request, inventory_id: UUID, inventory_update: InventoryUpdate):
     """Update an inventory record (partial update)."""
     update_data = inventory_update.model_dump(exclude_unset=True)
     if not update_data:
@@ -628,11 +886,13 @@ def update_inventory(inventory_id: UUID, inventory_update: InventoryUpdate):
             if not row:
                 raise HTTPException(
                     status_code=404, detail="Inventory record not found")
-            return row_to_inventory_read(row)
+            
+            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+            return row_to_inventory_read(row=row, links=links)
 
 
 @app.patch("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
-def adjust_inventory(inventory_id: UUID, adjustment: InventoryAdjustment):
+def adjust_inventory(request: Request, inventory_id: UUID, adjustment: InventoryAdjustment):
     """Adjust inventory quantity (add or remove stock)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -665,7 +925,9 @@ def adjust_inventory(inventory_id: UUID, adjustment: InventoryAdjustment):
                 WHERE inventory_id=%s
             """, (str(inventory_id),))
             row = cur.fetchone()
-            return row_to_inventory_read(row)
+
+            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+            return row_to_inventory_read(row=row, links=links)
 
 
 @app.delete("/inventory/{inventory_id}", status_code=204)

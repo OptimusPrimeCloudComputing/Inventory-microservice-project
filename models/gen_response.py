@@ -12,7 +12,7 @@ class Link(BaseModel):
     href: str = Field(
         ...,
         description="The URL of the link.",
-        json_schema_extra={"example": "https://api.example.com/products/123"},
+        json_schema_extra={"example": "https://api.example.com/products/11111111-1111-4111-8111-111111111111"},
     )
 
     model_config = {
@@ -20,7 +20,7 @@ class Link(BaseModel):
             "examples": [
                 {
                     "rel": "self",
-                    "href": "https://api.example.com/products/123",
+                    "href": "https://api.example.com/products/11111111-1111-4111-8111-111111111111",
                 }
             ]
         }
