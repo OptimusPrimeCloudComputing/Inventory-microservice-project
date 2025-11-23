@@ -15,6 +15,7 @@ from datetime import timezone
 
 from fastapi import FastAPI, HTTPException, Response, status, Request, Query, Path
 from fastapi_pagination import add_pagination
+from fastapi.middleware.cors import CORSMiddleware
 
 from models.product import ProductCreate, ProductRead, ProductReplace, ProductUpdate, ProductResponse
 from models.inventory import (
@@ -273,10 +274,22 @@ app = FastAPI(
 
 add_pagination(app)
 
+# ============================================================================
+# CORS Middleware Configuration
+# ============================================================================
+# Enable CORS to accept requests from any origin (client URL)
+# Useful for frontend applications, webhooks, and external integrations
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow requests from any origin
+    allow_credentials=False,  # Allow credentials (cookies, auth headers)
+    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, PUT, PATCH, DELETE, etc.)
+    allow_headers=["*"],  # Allow all headers (Content-Type, Authorization, etc.)
+)
 
-# -----------------------------------------------------------------------------
+# ============================================================================
 # Health endpoints
-# -----------------------------------------------------------------------------
+# ============================================================================
 
 
 def make_health(echo: Optional[str], path_echo: Optional[str] = None) -> Health:
