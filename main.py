@@ -25,9 +25,11 @@ from models.inventory import (
     InventoryAdjustment,
     InventoryResponse,
 )
+from models.async_response import AsyncOperationResponse, OperationStatusResponse, OperationStatus
 from models.gen_response import PaginateResponse
 from models.health import Health
 from db import get_connection
+from async_manager import async_operation_manager
 import pymysql
 
 
@@ -303,6 +305,39 @@ def get_health_with_path(
 
 
 # -----------------------------------------------------------------------------
+# Async Operations endpoints
+# -----------------------------------------------------------------------------
+
+
+@app.get("/operations/{operation_id}", response_model=OperationStatusResponse)
+async def get_operation_status(operation_id: str = Path(..., description="Operation ID"), response: Response = None):
+    """Poll the status of an async operation."""
+    operation = await async_operation_manager.get_operation(operation_id)
+    if not operation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Operation {operation_id} not found"
+        )
+    
+    if operation.status == OperationStatus.COMPLETED and operation.result:
+        etag = operation.result.get("etag")
+        if etag and response:
+            response.headers["ETag"] = etag
+    
+    return OperationStatusResponse(
+        operation_id=operation.operation_id,
+        status=operation.status,
+        message=operation.message,
+        progress_percent=operation.progress_percent,
+        created_at=operation.created_at,
+        updated_at=operation.updated_at,
+        result=operation.result,
+        error=operation.error
+    )
+
+
+
+# -----------------------------------------------------------------------------
 # Product endpoints
 # -----------------------------------------------------------------------------
 
@@ -528,227 +563,337 @@ def get_product(request: Request, response: Response, product_id: UUID = Path(..
         return row_to_product_read(row=row, links=links)
 
 
-@app.put("/products/{product_id}", response_model=ProductRead)
-def replace_product(
+@app.put("/products/{product_id}", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def replace_product(
     request: Request,
     response: Response,
     product_id: UUID = Path(..., description="Product ID"),
     product_replace: ProductReplace = None,
 ):
-    """Replace a product entirely (all fields required). The product ID will remain the same."""
+    """Replace a product entirely (all fields required). The product ID will remain the same. Returns 202 Accepted with async operation."""
     if product_replace is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body is required")
     
-    replace_data = product_replace.model_dump()
+    if_match = request.headers.get("if-match")
+    if_unmodified_since = request.headers.get("if-unmodified-since")
+    base_url = str(request.base_url).rstrip('/')
     
-    # Validate that all required fields are present
-    required_fields = {"sku", "name", "price", "is_active"}
-    missing_fields = required_fields - set(replace_data.keys())
-    if missing_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f"Missing required fields for full replacement: {', '.join(missing_fields)}"
-        )
-    
-    # Check if SKU is being changed and if new SKU already exist
-    if "sku" in replace_data:
+    async def _async_replace_product():
+        """Coroutine to execute product replacement asynchronously."""
+        replace_data = product_replace.model_dump()
+        
+        # Validate that all required fields are present
+        required_fields = {"sku", "name", "price", "is_active"}
+        missing_fields = required_fields - set(replace_data.keys())
+        if missing_fields:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail=f"Missing required fields for full replacement: {', '.join(missing_fields)}"
+            )
+        
+        # Check if SKU is being changed and if new SKU already exist
+        if "sku" in replace_data:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM products WHERE sku = %s AND product_id != %s",
+                        (replace_data["sku"], str(product_id))
+                    )
+                    if cur.fetchone():
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Product with SKU '{replace_data['sku']}' already exists"
+                        )
+
+        fields = []
+        params = []
+        for k, v in replace_data.items():
+            fields.append(f"{k}=%s")
+            params.append(v)
+
+        params.append(str(product_id))
+
         with get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM products WHERE sku = %s AND product_id != %s",
-                    (replace_data["sku"], str(product_id))
-                )
-                if cur.fetchone():
+                # Check if product exists
+                cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(product_id),))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+                
+                # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+                cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
+                current_row = cur.fetchone()
+                if not current_row:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+                
+                current_etag = create_etag(current_row)
+
+                if if_match:
+                    if not _etag_matches(if_match, current_etag):
+                        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+                else:
+                    # check If-Unmodified-Since
+                    if if_unmodified_since and current_row.get("updated_at") is not None:
+                        parsed = _parse_http_date(if_unmodified_since)
+                        if parsed is not None:
+                            updated_at = current_row.get("updated_at")
+                            if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                                updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if updated_at > parsed:
+                                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+                
+                sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
+                cur.execute(sql, params)
+                conn.commit()
+
+                cur.execute("""
+                    SELECT *
+                    FROM products
+                    WHERE product_id=%s
+                """, (str(product_id),))
+                row = cur.fetchone()
+                if not row:
                     raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Product with SKU '{replace_data['sku']}' already exists"
-                    )
+                        status_code=404, detail="Product not found")    
 
-    fields = []
-    params = []
-    for k, v in replace_data.items():
-        fields.append(f"{k}=%s")
-        params.append(v)
+                # Create links manually without request object
+                cur.execute("""
+                    SELECT inventory_id
+                    FROM inventory
+                    WHERE product_id=%s
+                """, (str(product_id),))
+                inv_row = cur.fetchone()
 
-    params.append(str(product_id))
+                links = [
+                    {
+                        "rel": "self",
+                        "href": f"{base_url}/products/{product_id}"
+                    }
+                ]
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Check if product exists
-            cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(product_id),))
-            if not cur.fetchone():
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-            
-            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
-            cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
-            current_row = cur.fetchone()
-            if not current_row:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-            
-            current_etag = create_etag(current_row)
+                if inv_row:
+                    links.append({
+                        "rel": "inventory-check",
+                        "href": f"{base_url}/inventory/{inv_row['inventory_id']}"
+                    })
+                else:
+                    links.append({
+                        "rel": "inventory-check",
+                        "href": f"{base_url}/inventory"
+                    })
 
-            if_match = request.headers.get("if-match")
-            if if_match:
-                if not _etag_matches(if_match, current_etag):
-                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-            else:
-                # check If-Unmodified-Since
-                ius = request.headers.get("if-unmodified-since")
-                if ius and current_row.get("updated_at") is not None:
-                    parsed = _parse_http_date(ius)
-                    if parsed is not None:
-                        updated_at = current_row.get("updated_at")
-                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
-                        if updated_at > parsed:
-                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
-            
-            sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
-            cur.execute(sql, params)
-            conn.commit()
+                etag = create_etag(row)
 
-            cur.execute("""
-                SELECT *
-                FROM products
-                WHERE product_id=%s
-            """, (str(product_id),))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(
-                    status_code=404, detail="Product not found")    
-
-            links = set_product_links(product_id=product_id, request=request, cur=cur)
-
-            etag = create_etag(row)
-
-            if etag:
-                response.headers["ETag"] = etag
-            _set_last_modified_header(response, row.get("updated_at"))
-
-            return row_to_product_read(row=row, links=links)
+                product_data = row_to_product_read(row=row, links=links)
+                return {
+                    "product": product_data.model_dump(),
+                    "etag": etag
+                }
+    
+    # Create async operation
+    operation_id = await async_operation_manager.create_operation(
+        message="Product replacement initiated",
+        coroutine=_async_replace_product()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Product replacement initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
         
 
-@app.patch("/products/{product_id}", response_model=ProductRead)
-def update_product(
+@app.patch("/products/{product_id}", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def update_product(
     request: Request,
     response: Response,
     product_id: UUID = Path(..., description="Product ID"),
     product_update: ProductUpdate = None,
 ):
-    """Update a product record (partial update)."""
-    update_data = product_update.model_dump(exclude_unset=True)
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No fields to update")
+    """Update a product record (partial update). Returns 202 Accepted with async operation."""
     
-    # Check if SKU is being changed and if new SKU already exist
-    if "sku" in update_data:
+    # Capture request data that will be needed in the async operation
+    if_match = request.headers.get("if-match")
+    if_unmodified_since = request.headers.get("if-unmodified-since")
+    base_url = str(request.base_url).rstrip('/')
+    
+    async def _async_update_product():
+        """Coroutine to execute product update asynchronously."""
+        update_data = product_update.model_dump(exclude_unset=True)
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        
+        # Check if SKU is being changed and if new SKU already exist
+        if "sku" in update_data:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM products WHERE sku = %s AND product_id != %s",
+                        (update_data["sku"], str(product_id))
+                    )
+                    if cur.fetchone():
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Product with SKU '{update_data['sku']}' already exists"
+                        )
+
+
+        fields = []
+        params = []
+        for k, v in update_data.items():
+            fields.append(f"{k}=%s")
+            params.append(v)
+
+        params.append(str(product_id))
+
         with get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM products WHERE sku = %s AND product_id != %s",
-                    (update_data["sku"], str(product_id))
-                )
-                if cur.fetchone():
+                # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+                cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
+                current_row = cur.fetchone()
+                if not current_row:
+                    raise HTTPException(status_code=404, detail="Product not found")
+                
+                current_etag = create_etag(current_row)
+
+                if if_match:
+                    if not _etag_matches(if_match, current_etag):
+                        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+                else:
+                    if if_unmodified_since and current_row.get("updated_at") is not None:
+                        parsed = _parse_http_date(if_unmodified_since)
+                        if parsed is not None:
+                            updated_at = current_row.get("updated_at")
+                            if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                                updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if updated_at > parsed:
+                                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
+                sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
+                cur.execute(sql, params)
+                conn.commit()
+
+                cur.execute("""
+                    SELECT *
+                    FROM products
+                    WHERE product_id=%s
+                """, (str(product_id),))
+                row = cur.fetchone()
+                if not row:
                     raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Product with SKU '{update_data['sku']}' already exists"
-                    )
+                        status_code=404, detail="Product not found")    
+
+                # Create links manually without request object
+                cur.execute("""
+                    SELECT inventory_id
+                    FROM inventory
+                    WHERE product_id=%s
+                """, (str(product_id),))
+                inv_row = cur.fetchone()
+
+                links = [
+                    {
+                        "rel": "self",
+                        "href": f"{base_url}/products/{product_id}"
+                    }
+                ]
+
+                if inv_row:
+                    links.append({
+                        "rel": "inventory-check",
+                        "href": f"{base_url}/inventory/{inv_row['inventory_id']}"
+                    })
+                else:
+                    links.append({
+                        "rel": "inventory-check",
+                        "href": f"{base_url}/inventory"
+                    })
+
+                etag = create_etag(row)
+
+                product_data = row_to_product_read(row=row, links=links)
+                return {
+                    "product": product_data.model_dump(),
+                    "etag": etag
+                }
+    
+    operation_id = await async_operation_manager.create_operation(
+        message="Product update initiated",
+        coroutine=_async_update_product()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Product update initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
 
 
-    fields = []
-    params = []
-    for k, v in update_data.items():
-        fields.append(f"{k}=%s")
-        params.append(v)
+@app.delete("/products/{product_id}", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def delete_product(
+    request: Request,
+    response: Response,
+    product_id: UUID = Path(..., description="Product ID")
+):
+    """Delete a product record. Returns 202 Accepted with async operation."""
+    
+    # Capture request data that will be needed in the async operation
+    if_match = request.headers.get("if-match")
+    if_unmodified_since = request.headers.get("if-unmodified-since")
+    
+    async def _async_delete_product():
+        """Coroutine to execute product deletion asynchronously."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check current ETag before deleting
+                cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
+                current_row = cur.fetchone()
+                if not current_row:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+                
+                current_etag = create_etag(current_row)
 
-    params.append(str(product_id))
+                if if_match:
+                    if not _etag_matches(if_match, current_etag):
+                        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+                else:
+                    if if_unmodified_since and current_row.get("updated_at") is not None:
+                        parsed = _parse_http_date(if_unmodified_since)
+                        if parsed is not None:
+                            updated_at = current_row.get("updated_at")
+                            if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                                updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if updated_at > parsed:
+                                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
-            cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
-            current_row = cur.fetchone()
-            if not current_row:
-                raise HTTPException(status_code=404, detail="Product not found")
-            
-            current_etag = create_etag(current_row)
-
-            if_match = request.headers.get("if-match")
-            if if_match:
-                if not _etag_matches(if_match, current_etag):
-                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-            else:
-                ius = request.headers.get("if-unmodified-since")
-                if ius and current_row.get("updated_at") is not None:
-                    parsed = _parse_http_date(ius)
-                    if parsed is not None:
-                        updated_at = current_row.get("updated_at")
-                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
-                        if updated_at > parsed:
-                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
-
-            sql = f"UPDATE products SET {', '.join(fields)}, updated_at=NOW() WHERE product_id=%s"
-            print(sql)
-            cur.execute(sql, params)
-            conn.commit()
-
-            cur.execute("""
-                SELECT *
-                FROM products
-                WHERE product_id=%s
-            """, (str(product_id),))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(
-                    status_code=404, detail="Product not found")    
-
-            links = set_product_links(product_id=product_id, request=request, cur=cur)
-
-            etag = create_etag(row)
-
-            if etag:
-                response.headers["ETag"] = etag
-            _set_last_modified_header(response, row.get("updated_at"))
-
-            return row_to_product_read(row=row, links=links)
-
-
-@app.delete("/products/{product_id}", status_code=204)
-def delete_product(request: Request, response: Response, product_id: UUID = Path(..., description="Product ID")):
-    """Delete a product record."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Check current ETag before deleting
-            cur.execute("SELECT * FROM products WHERE product_id=%s", (str(product_id),))
-            current_row = cur.fetchone()
-            if not current_row:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-            
-            current_etag = create_etag(current_row)
-
-            if_match = request.headers.get("if-match")
-            if if_match:
-                if not _etag_matches(if_match, current_etag):
-                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-            else:
-                ius = request.headers.get("if-unmodified-since")
-                if ius and current_row.get("updated_at") is not None:
-                    parsed = _parse_http_date(ius)
-                    if parsed is not None:
-                        updated_at = current_row.get("updated_at")
-                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
-                        if updated_at > parsed:
-                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
-
-            cur.execute("DELETE FROM products WHERE product_id=%s",
-                        (str(product_id),))
-            if cur.rowcount == 0:
-                raise HTTPException(
-                    status_code=404, detail="Product not found")
-            conn.commit()
-    return None
+                cur.execute("DELETE FROM products WHERE product_id=%s",
+                            (str(product_id),))
+                if cur.rowcount == 0:
+                    raise HTTPException(
+                        status_code=404, detail="Product not found")
+                conn.commit()
+        
+        return {"product_id": str(product_id), "message": "Product deleted successfully"}
+    
+    operation_id = await async_operation_manager.create_operation(
+        message="Product deletion initiated",
+        coroutine=_async_delete_product()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Product deletion initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -999,256 +1144,400 @@ def get_inventory_by_product(request: Request, response: Response, product_id: U
         return row_to_inventory_read(row=row, links=links)
 
 
-@app.put("/inventory/{inventory_id}", response_model=InventoryRead)
-def replace_inventory(
+@app.put("/inventory/{inventory_id}", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def replace_inventory(
     request: Request,
     response: Response,
     inventory_id: UUID,
     inventory_replace: InventoryReplace
 ):
-    """Replace an inventory record entirely (all fields required). The inventory ID will remain the same."""
-    if inventory_replace is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body is required")
+    """Replace an inventory record entirely (all fields required). Returns 202 Accepted with async operation."""
     
-    replace_data = inventory_replace.model_dump(exclude_unset=False)
+    # Capture request data that will be needed in the async operation
+    if_match = request.headers.get("if-match")
+    if_unmodified_since = request.headers.get("if-unmodified-since")
+    base_url = str(request.base_url).rstrip('/')
     
-    # Validate that the product exists
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(replace_data["product_id"]),))
-            if not cur.fetchone():
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, 
-                    detail=f"Product with ID {replace_data['product_id']} not found"
-                )
-            
-    # Validate that all required fields are present
-    required_fields = {"product_id", "quantity", "reserved_quantity"}
-    missing_fields = required_fields - set(replace_data.keys())
-    if missing_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f"Missing required fields for full replacement: {', '.join(missing_fields)}"
-        )
+    async def _async_replace_inventory():
+        """Coroutine to execute inventory replacement asynchronously."""
+        if inventory_replace is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body is required")
+        
+        replace_data = inventory_replace.model_dump(exclude_unset=False)
+        
+        # Validate that the product exists
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM products WHERE product_id=%s", (str(replace_data["product_id"]),))
+                if not cur.fetchone():
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND, 
+                        detail=f"Product with ID {replace_data['product_id']} not found"
+                    )
+                
+        # Validate that all required fields are present
+        required_fields = {"product_id", "quantity", "reserved_quantity"}
+        missing_fields = required_fields - set(replace_data.keys())
+        if missing_fields:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail=f"Missing required fields for full replacement: {', '.join(missing_fields)}"
+            )
 
-    fields = []
-    params = []
-    for k, v in replace_data.items():
-        fields.append(f"{k}=%s")
-        params.append(v)
+        fields = []
+        params = []
+        for k, v in replace_data.items():
+            fields.append(f"{k}=%s")
+            params.append(v)
 
-    params.append(str(inventory_id))
+        params.append(str(inventory_id))
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
-            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
-            existing = cur.fetchone()
-            if not existing:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory record not found")
-            
-            current_etag = create_etag(existing)
-            
-            if_match = request.headers.get("if-match")
-            if if_match:
-                if not _etag_matches(if_match, current_etag):
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+                cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+                existing = cur.fetchone()
+                if not existing:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory record not found")
+                
+                current_etag = create_etag(existing)
+                
+                if if_match:
+                    if not _etag_matches(if_match, current_etag):
+                        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+                else:
+                    if if_unmodified_since and existing.get("updated_at") is not None:
+                        parsed = _parse_http_date(if_unmodified_since)
+                        if parsed is not None:
+                            updated_at = existing.get("updated_at")
+                            if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                                updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if updated_at > parsed:
+                                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
+                sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
+                cur.execute(sql, params)
+                conn.commit()
+
+                cur.execute("""
+                    SELECT *,
+                           (quantity - reserved_quantity) AS available_quantity,
+                           (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                    FROM inventory
+                    WHERE inventory_id=%s
+                """, (str(inventory_id),))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(
+                        status_code=404, detail="Inventory record not found")
+                
+                # Create links manually without request object
+                cur.execute("""
+                    SELECT product_id
+                    FROM inventory
+                    WHERE inventory_id=%s
+                """, (str(inventory_id),))
+                prod_row = cur.fetchone()
+
+                links = [
+                    {
+                        "rel": "self",
+                        "href": f"{base_url}/inventory/{inventory_id}"
+                    },
+                    {
+                        "rel": "product",
+                        "href": f"{base_url}/products/{prod_row['product_id']}"
+                    }
+                ]
+
+                etag = create_etag(row)
+
+                inventory_data = row_to_inventory_read(row=row, links=links)
+                return {
+                    "inventory": inventory_data.model_dump(),
+                    "etag": etag
+                }
+    
+    operation_id = await async_operation_manager.create_operation(
+        message="Inventory replacement initiated",
+        coroutine=_async_replace_inventory()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Inventory replacement initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
+
+
+@app.patch("/inventory/{inventory_id}", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def update_inventory(
+    request: Request,
+    response: Response,
+    inventory_id: UUID,
+    inventory_update: InventoryUpdate
+):
+    """Update an inventory record (partial update). Returns 202 Accepted with async operation."""
+    
+    # Capture request data that will be needed in the async operation
+    if_match = request.headers.get("if-match")
+    if_unmodified_since = request.headers.get("if-unmodified-since")
+    base_url = str(request.base_url).rstrip('/')
+    
+    async def _async_update_inventory():
+        """Coroutine to execute inventory update asynchronously."""
+        update_data = inventory_update.model_dump(exclude_unset=True)
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        fields = []
+        params = []
+        for k, v in update_data.items():
+            fields.append(f"{k}=%s")
+            params.append(v)
+
+        params.append(str(inventory_id))
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
+                cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+                existing = cur.fetchone()
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Inventory record not found")
+                
+                current_etag = create_etag(existing)
+
+                if if_match:
+                    if not _etag_matches(if_match, current_etag):
+                        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+                else:
+                    if if_unmodified_since and existing.get("updated_at") is not None:
+                        parsed = _parse_http_date(if_unmodified_since)
+                        if parsed is not None:
+                            updated_at = existing.get("updated_at")
+                            if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                                updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if updated_at > parsed:
+                                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
+
+                sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
+                cur.execute(sql, params)
+                conn.commit()
+
+                cur.execute("""
+                    SELECT *,
+                           (quantity - reserved_quantity) AS available_quantity,
+                           (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                    FROM inventory
+                    WHERE inventory_id=%s
+                """, (str(inventory_id),))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(
+                        status_code=404, detail="Inventory record not found")
+                
+                # Create links manually without request object
+                cur.execute("""
+                    SELECT product_id
+                    FROM inventory
+                    WHERE inventory_id=%s
+                """, (str(inventory_id),))
+                prod_row = cur.fetchone()
+
+                links = [
+                    {
+                        "rel": "self",
+                        "href": f"{base_url}/inventory/{inventory_id}"
+                    },
+                    {
+                        "rel": "product",
+                        "href": f"{base_url}/products/{prod_row['product_id']}"
+                    }
+                ]
+
+                etag = create_etag(row)
+
+                inventory_data = row_to_inventory_read(row=row, links=links)
+                return {
+                    "inventory": inventory_data.model_dump(),
+                    "etag": etag
+                }
+    
+    operation_id = await async_operation_manager.create_operation(
+        message="Inventory update initiated",
+        coroutine=_async_update_inventory()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Inventory update initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
+
+
+@app.patch("/inventory/{inventory_id}/adjust", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def adjust_inventory(
+    request: Request,
+    response: Response,
+    inventory_id: UUID,
+    adjustment: InventoryAdjustment
+):
+    """Adjust inventory quantity (add or remove stock). Returns 202 Accepted with async operation."""
+    
+    # Capture request data that will be needed in the async operation
+    if_match = request.headers.get("if-match")
+    base_url = str(request.base_url).rstrip('/')
+    
+    async def _async_adjust_inventory():
+        """Coroutine to execute inventory adjustment asynchronously."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check If-Match for concurrency
+                cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+                existing = cur.fetchone()
+
+                current_etag = create_etag(existing) if existing else None
+
+                if if_match and current_etag and if_match != current_etag:
                     raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-            else:
-                ius = request.headers.get("if-unmodified-since")
-                if ius and existing.get("updated_at") is not None:
-                    parsed = _parse_http_date(ius)
-                    if parsed is not None:
-                        updated_at = existing.get("updated_at")
-                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
-                        if updated_at > parsed:
-                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
 
-            sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
-            cur.execute(sql, params)
-            conn.commit()
+                cur.execute(
+                    "SELECT quantity, reserved_quantity, reorder_level FROM inventory WHERE inventory_id=%s FOR UPDATE", (str(inventory_id),))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(
+                        status_code=404, detail="Inventory record not found")
 
-            cur.execute("""
-                SELECT *,
-                       (quantity - reserved_quantity) AS available_quantity,
-                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
-                FROM inventory
-                WHERE inventory_id=%s
-            """, (str(inventory_id),))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(
-                    status_code=404, detail="Inventory record not found")
-            
-            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
+                new_qty = row["quantity"] + adjustment.adjustment
+                if new_qty < 0:
+                    raise HTTPException(
+                        status_code=400, detail="Insufficient stock")
 
-            etag = create_etag(row)
-            if etag:
-                response.headers["ETag"] = etag
+                cur.execute("""
+                    UPDATE inventory
+                    SET quantity=%s,
+                        last_restocked_at = CASE WHEN %s > 0 THEN NOW() ELSE last_restocked_at END,
+                        updated_at=NOW()
+                    WHERE inventory_id=%s
+                """, (new_qty, adjustment.adjustment, str(inventory_id)))
+                conn.commit()
 
-            _set_last_modified_header(response, row.get("updated_at"))
+                cur.execute("""
+                    SELECT *,
+                           (quantity - reserved_quantity) AS available_quantity,
+                           (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
+                    FROM inventory
+                    WHERE inventory_id=%s
+                """, (str(inventory_id),))
+                row = cur.fetchone()
 
-            return row_to_inventory_read(row=row, links=links)
+                # Create links manually without request object
+                cur.execute("""
+                    SELECT product_id
+                    FROM inventory
+                    WHERE inventory_id=%s
+                """, (str(inventory_id),))
+                prod_row = cur.fetchone()
 
+                links = [
+                    {
+                        "rel": "self",
+                        "href": f"{base_url}/inventory/{inventory_id}"
+                    },
+                    {
+                        "rel": "product",
+                        "href": f"{base_url}/products/{prod_row['product_id']}"
+                    }
+                ]
 
-@app.patch("/inventory/{inventory_id}", response_model=InventoryRead)
-def update_inventory(request: Request, response: Response, inventory_id: UUID, inventory_update: InventoryUpdate):
-    """Update an inventory record (partial update)."""
-    update_data = inventory_update.model_dump(exclude_unset=True)
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No fields to update")
+                etag = create_etag(row)
 
-    fields = []
-    params = []
-    for k, v in update_data.items():
-        fields.append(f"{k}=%s")
-        params.append(v)
-
-    params.append(str(inventory_id))
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Concurrency checks: prefer If-Match; fallback to If-Unmodified-Since
-            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
-            existing = cur.fetchone()
-            if not existing:
-                raise HTTPException(status_code=404, detail="Inventory record not found")
-            
-            current_etag = create_etag(existing)
-
-            if_match = request.headers.get("if-match")
-            if if_match:
-                if not _etag_matches(if_match, current_etag):
-                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-            else:
-                ius = request.headers.get("if-unmodified-since")
-                if ius and existing.get("updated_at") is not None:
-                    parsed = _parse_http_date(ius)
-                    if parsed is not None:
-                        updated_at = existing.get("updated_at")
-                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
-                        if updated_at > parsed:
-                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
-
-            sql = f"UPDATE inventory SET {', '.join(fields)}, updated_at=NOW() WHERE inventory_id=%s"
-            print(sql)
-            cur.execute(sql, params)
-            conn.commit()
-
-            cur.execute("""
-                SELECT *,
-                       (quantity - reserved_quantity) AS available_quantity,
-                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
-                FROM inventory
-                WHERE inventory_id=%s
-            """, (str(inventory_id),))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(
-                    status_code=404, detail="Inventory record not found")
-            
-            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
-
-            etag = create_etag(row)
-
-            if etag:
-                response.headers["ETag"] = etag
-
-            _set_last_modified_header(response, row.get("updated_at"))
-
-            return row_to_inventory_read(row=row, links=links)
+                inventory_data = row_to_inventory_read(row=row, links=links)
+                return {
+                    "inventory": inventory_data.model_dump(),
+                    "etag": etag
+                }
+    
+    operation_id = await async_operation_manager.create_operation(
+        message="Inventory adjustment initiated",
+        coroutine=_async_adjust_inventory()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Inventory adjustment initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
 
 
-@app.patch("/inventory/{inventory_id}/adjust", response_model=InventoryRead)
-def adjust_inventory(request: Request, response: Response, inventory_id: UUID, adjustment: InventoryAdjustment):
-    """Adjust inventory quantity (add or remove stock)."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Check If-Match for concurrency
-            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
-            existing = cur.fetchone()
+@app.delete("/inventory/{inventory_id}", response_model=AsyncOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def delete_inventory(
+    request: Request,
+    inventory_id: UUID,
+    response: Response
+):
+    """Delete an inventory record. Returns 202 Accepted with async operation."""
+    
+    # Capture request data that will be needed in the async operation
+    if_match = request.headers.get("if-match")
+    if_unmodified_since = request.headers.get("if-unmodified-since")
+    
+    async def _async_delete_inventory():
+        """Coroutine to execute inventory deletion asynchronously."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
+                current_row = cur.fetchone()
+                if not current_row:
+                    raise HTTPException(status_code=404, detail="Inventory record not found")
+                
+                current_etag = create_etag(current_row)
 
-            current_etag = create_etag(existing) if existing else None
+                if if_match:
+                    if not _etag_matches(if_match, current_etag):
+                        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
+                else:
+                    if if_unmodified_since and current_row.get("updated_at") is not None:
+                        parsed = _parse_http_date(if_unmodified_since)
+                        if parsed is not None:
+                            updated_at = current_row.get("updated_at")
+                            if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
+                                updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if updated_at > parsed:
+                                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
 
-            if_match = request.headers.get("if-match")
-            if if_match and current_etag and if_match != current_etag:
-                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-
-            cur.execute(
-                "SELECT quantity, reserved_quantity, reorder_level FROM inventory WHERE inventory_id=%s FOR UPDATE", (str(inventory_id),))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(
-                    status_code=404, detail="Inventory record not found")
-
-            new_qty = row["quantity"] + adjustment.adjustment
-            if new_qty < 0:
-                raise HTTPException(
-                    status_code=400, detail="Insufficient stock")
-
-            cur.execute("""
-                UPDATE inventory
-                SET quantity=%s,
-                    last_restocked_at = CASE WHEN %s > 0 THEN NOW() ELSE last_restocked_at END,
-                    updated_at=NOW()
-                WHERE inventory_id=%s
-            """, (new_qty, adjustment.adjustment, str(inventory_id)))
-            conn.commit()
-
-            cur.execute("""
-                SELECT *,
-                       (quantity - reserved_quantity) AS available_quantity,
-                       (reorder_level IS NOT NULL AND quantity <= reorder_level) AS needs_reorder
-                FROM inventory
-                WHERE inventory_id=%s
-            """, (str(inventory_id),))
-            row = cur.fetchone()
-
-            links = set_inventory_links(inventory_id=inventory_id, request=request, cur=cur)
-
-            etag = create_etag(row)
-
-            if etag:
-                response.headers["ETag"] = etag
-
-            return row_to_inventory_read(row=row, links=links)
-
-
-@app.delete("/inventory/{inventory_id}", status_code=204)
-def delete_inventory(request: Request, inventory_id: UUID, response: Response):
-    """Delete an inventory record."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM inventory WHERE inventory_id=%s", (str(inventory_id),))
-            current_row = cur.fetchone()
-            if not current_row:
-                raise HTTPException(status_code=404, detail="Inventory record not found")
-            
-            current_etag = create_etag(current_row)
-
-            if_match = request.headers.get("if-match")
-            if if_match:
-                if not _etag_matches(if_match, current_etag):
-                    raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="ETag does not match")
-            else:
-                ius = request.headers.get("if-unmodified-since")
-                if ius and current_row.get("updated_at") is not None:
-                    parsed = _parse_http_date(ius)
-                    if parsed is not None:
-                        updated_at = current_row.get("updated_at")
-                        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
-                        if updated_at > parsed:
-                            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Resource has been modified")
-
-            cur.execute("DELETE FROM inventory WHERE inventory_id=%s",
-                        (str(inventory_id),))
-            if cur.rowcount == 0:
-                raise HTTPException(
-                    status_code=404, detail="Inventory record not found")
-            conn.commit()
-    return None
+                cur.execute("DELETE FROM inventory WHERE inventory_id=%s",
+                            (str(inventory_id),))
+                if cur.rowcount == 0:
+                    raise HTTPException(
+                        status_code=404, detail="Inventory record not found")
+                conn.commit()
+        
+        return {"inventory_id": str(inventory_id), "message": "Inventory deleted successfully"}
+    
+    operation_id = await async_operation_manager.create_operation(
+        message="Inventory deletion initiated",
+        coroutine=_async_delete_inventory()
+    )
+    
+    response.headers["Location"] = str(request.url_for("get_operation_status", operation_id=operation_id))
+    
+    return AsyncOperationResponse(
+        operation_id=operation_id,
+        status=OperationStatus.PENDING,
+        message="Inventory deletion initiated",
+        status_url=str(request.url_for("get_operation_status", operation_id=operation_id))
+    )
 
 
 # -----------------------------------------------------------------------------
