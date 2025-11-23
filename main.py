@@ -499,7 +499,7 @@ def list_products(
         request_params = "&".join([f"{key}={val}" for key, val in params.items()])
         if request_params:
             request_params += "&"
-        return f"{str(request.url_for("list_products").path)}?{request_params}limit={limit}&offset={offset_val}"
+        return f"{str(request.url_for('list_products').path)}?{request_params}limit={limit}&offset={offset_val}"
 
     links = [
         {
@@ -1049,7 +1049,7 @@ def list_inventory(
         request_params = "&".join([f"{key}={val}" for key, val in params.items()])
         if request_params:
             request_params += "&"
-        return f"{str(request.url_for("list_inventory").path)}?{request_params}limit={limit}&offset={offset_val}"
+        return f"{str(request.url_for('list_inventory').path)}?{request_params}limit={limit}&offset={offset_val}"
 
     links = [
         {
