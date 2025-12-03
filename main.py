@@ -304,6 +304,7 @@ def make_health(echo: Optional[str], path_echo: Optional[str] = None) -> Health:
 
 
 @app.get("/health", response_model=Health)
+@app.head("/health", response_model=Health)
 def get_health_no_path(echo: str | None = Query(None, description="Optional echo string")):
     return make_health(echo=echo, path_echo=None)
 
