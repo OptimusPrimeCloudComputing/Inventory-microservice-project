@@ -281,10 +281,18 @@ add_pagination(app)
 # Useful for frontend applications, webhooks, and external integrations
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow requests from any origin
-    allow_credentials=False,  # Allow credentials (cookies, auth headers)
-    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, PUT, PATCH, DELETE, etc.)
-    allow_headers=["*"],  # Allow all headers (Content-Type, Authorization, etc.)
+    allow_origins=[
+        "https://storage.googleapis.com",  # GCS hosted frontend
+        "http://localhost:5173",            # Local development
+        "http://localhost:3000",            # Alternative local dev port
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows GET, POST, PUT, DELETE, etc.
+    allow_headers=["*"],  # Allows all headers
+    # allow_origins=["*"],  # Allow requests from any origin
+    # allow_credentials=False,  # Allow credentials (cookies, auth headers)
+    # allow_methods=["*"],  # Allow all HTTP methods (GET, POST, PUT, PATCH, DELETE, etc.)
+    # allow_headers=["*"],  # Allow all headers (Content-Type, Authorization, etc.)
 )
 
 # ============================================================================
